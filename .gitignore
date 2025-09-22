@@ -1,0 +1,6 @@
+
+# Ignore service accounts and env files
+backend/secrets/
+backend/.env
+**/*.pem
+**/*.p12
