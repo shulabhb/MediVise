@@ -6,7 +6,7 @@ import HomeLink from '../components/HomeLink';
 import logo2 from '../assets/MediVise2.png';
 import UserMenu from '../components/UserMenu';
 import SOSButton from '../components/SOSButton';
-import { updatePassword, EmailAuthProvider, reauthenticateWithCredential, getAuth, sendPasswordResetEmail } from 'firebase/auth';
+import { updatePassword, EmailAuthProvider, reauthenticateWithCredential, getAuth, sendPasswordResetEmail, updateProfile } from 'firebase/auth';
 
 interface UserProfile {
   uid: string;
@@ -190,6 +190,12 @@ export default function Profile() {
         const data = await response.json();
         setProfile(data.user);
         setMessage('Profile updated successfully!');
+        // Keep Firebase displayName in sync with backend username
+        try {
+          if (user) {
+            await updateProfile(user, { displayName: username });
+          }
+        } catch {}
         // Refresh the page to update the dashboard greeting
         setTimeout(() => {
           window.location.reload();

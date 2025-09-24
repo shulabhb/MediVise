@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import { auth, googleProvider } from '../lib/firebase';
 import type { User } from 'firebase/auth';
-import { onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, signInWithPopup } from 'firebase/auth';
+import { onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, signInWithPopup, updateProfile } from 'firebase/auth';
 
 type AuthContextValue = {
   user: User | null;
@@ -33,7 +33,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       await signInWithEmailAndPassword(auth, email, password);
     },
     async signUpWithEmail(email, password, _username) {
-      await createUserWithEmailAndPassword(auth, email, password);
+      const cred = await createUserWithEmailAndPassword(auth, email, password);
+      // Best-effort: set displayName to provided username for consistency
+      if (_username && cred.user) {
+        try { await updateProfile(cred.user, { displayName: _username }); } catch {}
+      }
     },
     async signInWithGoogle() {
       await signInWithPopup(auth, googleProvider);
