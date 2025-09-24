@@ -6,7 +6,7 @@ type Props = {
   title?: string;
 };
 
-export default function UserIcon({ size = 20, color = '#e5e7eb', strokeWidth = 1.8, title = 'User' }: Props) {
+export default function UserIcon({ size = 20, color = '#0a0a0a', strokeWidth = 1.8, title = 'User' }: Props) {
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label={title} focusable="false">
       <title>{title}</title>

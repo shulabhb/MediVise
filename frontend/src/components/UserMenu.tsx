@@ -38,10 +38,10 @@ export default function UserMenu() {
       {open && (
         <div
           role="menu"
-          style={{ position: 'absolute', right: 0, top: '110%', minWidth: 160, background: 'rgba(255,255,255,0.10)', backdropFilter: 'blur(12px)', border: '1px solid rgba(255,255,255,0.25)', borderRadius: 12, boxShadow: '0 12px 28px rgba(0,0,0,0.35)', padding: 6, zIndex: 200 }}
+          style={{ position: 'absolute', right: 0, top: '110%', minWidth: 200, background: 'rgba(255,255,255,0.10)', backdropFilter: 'blur(12px)', border: '1px solid rgba(255,255,255,0.25)', borderRadius: 12, boxShadow: '0 12px 28px rgba(0,0,0,0.35)', padding: 6, zIndex: 200 }}
         >
-          <Link to="/profile" className="nav-link" role="menuitem" onClick={() => setOpen(false)} style={{ display: 'block', padding: '8px 12px', borderRadius: 8 }}>Profile</Link>
-          <button role="menuitem" onClick={onLogout} className="nav-link" style={{ display: 'block', width: '100%', textAlign: 'left', padding: '8px 12px', borderRadius: 8, background: 'transparent', border: 0, cursor: 'pointer' }}>Logout</button>
+          <Link to="/profile" className="nav-link" role="menuitem" onClick={() => setOpen(false)} style={{ display: 'block', padding: '10px 14px', borderRadius: 8 }}>Profile</Link>
+          <button role="menuitem" onClick={onLogout} className="nav-link" style={{ display: 'block', width: '100%', textAlign: 'left', padding: '10px 14px', borderRadius: 8, background: 'transparent', border: 0, cursor: 'pointer' }}>Logout</button>
         </div>
       )}
     </div>

@@ -124,6 +124,23 @@ async def check_username_availability(username: str, current_user: dict = Depend
     
     return {"available": True, "message": "Username is available"}
 
+# Public (unauthenticated) username availability check for signup preflight
+@app.get("/public/check-username/{username}")
+async def public_check_username_availability(username: str):
+    """Check if a username is available without authentication (for signup forms)."""
+    for existing_user in users_db.values():
+        if existing_user.get("username") == username:
+            return {"available": False, "message": "Username already taken"}
+    return {"available": True, "message": "Username is available"}
+
+@app.get("/public/resolve-username/{username}")
+async def public_resolve_username(username: str):
+    """Resolve a username to the corresponding email for username-based login."""
+    for existing_user in users_db.values():
+        if existing_user.get("username") == username:
+            return {"email": existing_user.get("email", "")}
+    raise HTTPException(status_code=404, detail="Username not found")
+
 @app.post("/sos-alert")
 async def send_sos_alert(alert_data: SOSAlert, current_user: dict = Depends(get_current_user)):
     """Send SOS emergency alert"""

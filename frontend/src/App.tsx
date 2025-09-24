@@ -4,9 +4,14 @@ import Home from './pages/Home'
 import About from './pages/About'
 import Dashboard from './pages/Dashboard'
 import Profile from './pages/Profile'
+import Documents from './pages/Documents'
 import Chat from './pages/Chat'
 import Medications from './pages/Medications'
 import Appointments from './pages/Appointments'
+import Game from './pages/Game'
+import Sudoku from './pages/Sudoku'
+import TicTacToe from './pages/TicTacToe'
+import Memory from './pages/Memory'
 import ProtectedRoute from './routes/ProtectedRoute'
 
 export default function App() {
@@ -40,6 +45,14 @@ export default function App() {
             }
           />
           <Route
+            path="/documents"
+            element={
+              <ProtectedRoute>
+                <Documents />
+              </ProtectedRoute>
+            }
+          />
+          <Route
             path="/chat"
             element={
               <ProtectedRoute>
@@ -60,6 +73,38 @@ export default function App() {
             element={
               <ProtectedRoute>
                 <Appointments />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/game"
+            element={
+              <ProtectedRoute>
+                <Game />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/game/sudoku"
+            element={
+              <ProtectedRoute>
+                <Sudoku />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/game/tictactoe"
+            element={
+              <ProtectedRoute>
+                <TicTacToe />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/game/memory"
+            element={
+              <ProtectedRoute>
+                <Memory />
               </ProtectedRoute>
             }
           />

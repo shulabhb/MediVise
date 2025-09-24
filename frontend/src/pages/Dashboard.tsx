@@ -1,11 +1,8 @@
 import { useAuth } from '../context/AuthContext';
 import { useState, useEffect } from 'react';
-import { Link } from 'react-router-dom';
-import HomeLink from '../components/HomeLink';
+import { useNavigate } from 'react-router-dom';
+import LoggedInNavbar from '../components/LoggedInNavbar';
 import { BentoGrid, BentoCard } from '../components/Bento';
-import logo2 from '../assets/MediVise2.png';
-import UserMenu from '../components/UserMenu';
-import SOSButton from '../components/SOSButton';
 import WordRotate from '../components/WordRotate';
 
 interface UserProfile {
@@ -19,6 +16,7 @@ interface UserProfile {
 
 export default function Dashboard() {
   const { user } = useAuth();
+  const navigate = useNavigate();
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [loadingProfile, setLoadingProfile] = useState(true);
 
@@ -37,8 +35,8 @@ export default function Dashboard() {
     return (
       <div style={{ position: 'absolute', inset: 0, padding: 10, opacity: .7 }}>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 6, marginBottom: 6 }}>
-          {weekdays.map(w => (
-            <div key={w} style={{ textAlign: 'center', fontSize: 10, color: '#6b7280' }}>{w}</div>
+          {weekdays.map((w, idx) => (
+            <div key={`${w}-${idx}`} style={{ textAlign: 'center', fontSize: 10, color: '#6b7280' }}>{w}</div>
           ))}
         </div>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 6 }}>
@@ -116,20 +114,7 @@ export default function Dashboard() {
 
   return (
     <div className="dashboard-page">
-      {/* Top Navigation - consistent with landing pages */}
-      <Link to="/about">
-        <img src={logo2} alt="MediVise" className="nav-logo-small" />
-      </Link>
-      <nav className="stage-nav">
-        <div className="nav-links">
-          <HomeLink className="nav-link active">Dashboard</HomeLink>
-          <Link to="/chat" className="nav-link">Chat</Link>
-          <Link to="/medications" className="nav-link">Medications</Link>
-          <Link to="/appointments" className="nav-link">Appointments</Link>
-          <SOSButton />
-          <UserMenu />
-        </div>
-      </nav>
+      <LoggedInNavbar />
 
       {/* Main Content */}
       <div className="dashboard-content">
@@ -181,6 +166,7 @@ export default function Dashboard() {
                 </div>
               </div>
             }
+            onClick={() => navigate('/chat')}
           />
           
           <BentoCard
@@ -206,6 +192,7 @@ export default function Dashboard() {
                 </div>
               </div>
             }
+            onClick={() => navigate('/chat')}
           />
           
           <BentoCard
@@ -228,6 +215,7 @@ export default function Dashboard() {
                 </div>
               </div>
             }
+            onClick={() => navigate('/documents')}
           />
           
           <BentoCard
@@ -251,6 +239,7 @@ export default function Dashboard() {
                 </div>
               </div>
             }
+            onClick={() => navigate('/appointments')}
           />
           
           <BentoCard
@@ -272,6 +261,7 @@ export default function Dashboard() {
                 </div>
               </div>
             }
+            onClick={() => navigate('/medications')}
           />
         </BentoGrid>
 
@@ -283,24 +273,37 @@ export default function Dashboard() {
               <span className="disclaimer-text">MediVise is not a professional medical advisor. Always consult with healthcare professionals for medical decisions.</span>
             </div>
             <div className="disclaimer-item">
-              <span className="disclaimer-icon">📋</span>
+            <span className="disclaimer-icon">⚠️</span>
+
               <span className="disclaimer-text">This platform is for informational purposes only and should not replace professional medical advice.</span>
             </div>
             <div className="disclaimer-item">
-              <span className="disclaimer-icon">🏥</span>
-              <span className="disclaimer-text">In case of medical emergency, contact emergency services immediately.</span>
+            <span className="disclaimer-icon">⚠️</span>
+            <span className="disclaimer-text">In case of medical emergency, contact emergency services immediately.</span>
             </div>
             <div className="disclaimer-item">
-              <span className="disclaimer-icon">🔒</span>
-              <span className="disclaimer-text">Your health data is protected with industry-standard security measures.</span>
+            <span className="disclaimer-icon">⚠️</span>
+            <span className="disclaimer-text">Your health data is protected with industry-standard security measures.</span>
             </div>
           </div>
         </div>
 
         {/* Footer */}
         <footer className="dashboard-footer">
-          <div className="footer-content">
-            <span className="footer-copyright">© 2025 MediVise by Shulabh Bhattarai</span>
+          <div className="footer-content" style={{ display: 'grid', gap: '0.75rem', width: '100%' }}>
+            <div className="helpline-carousel">
+              <div className="helpline-track">
+                <div className="helpline-item">Emergency: <a href="tel:911">911</a> — Immediate emergencies</div>
+                <div className="helpline-item">Mental Health: <a href="tel:988">988</a> — Suicide & Crisis Lifeline (24/7)</div>
+                <div className="helpline-item">Poison Control: <a href="tel:+18002221222">1‑800‑222‑1222</a></div>
+                <div className="helpline-item">Substance Use: <a href="tel:+18006624357">1‑800‑662‑HELP (4357)</a> — SAMHSA (24/7)</div>
+                <div className="helpline-item">Domestic Violence: <a href="tel:+18007997233">1‑800‑799‑SAFE (7233)</a></div>
+                <div className="helpline-item">Sexual Assault: <a href="tel:+18006564673">1‑800‑656‑HOPE (4673)</a></div>
+              </div>
+            </div>
+            <div style={{ textAlign: 'center' }}>
+              <span className="footercopyright">© 2025 MediVise by Shulabh Bhattarai -- shulabhb.com</span>
+            </div>
           </div>
         </footer>
       </div>

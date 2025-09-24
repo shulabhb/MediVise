@@ -106,9 +106,25 @@ const SOSButton: React.FC = () => {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const { user } = useAuth();
   const menuRef = useRef<HTMLDivElement>(null);
+  const hoverTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const handleSOSClick = () => {
-    setIsModalOpen(!isModalOpen);
+    setIsModalOpen(true);
+  };
+
+  const handleMouseEnter = () => {
+    if (hoverTimeoutRef.current) {
+      clearTimeout(hoverTimeoutRef.current);
+      hoverTimeoutRef.current = null;
+    }
+    setIsModalOpen(true);
+  };
+
+  const handleMouseLeave = () => {
+    hoverTimeoutRef.current = setTimeout(() => {
+      setIsModalOpen(false);
+      setSelectedEmergency(null);
+    }, 2000);
   };
 
   const handleEmergencySelect = (emergency: EmergencyType) => {
@@ -166,7 +182,12 @@ const SOSButton: React.FC = () => {
   }, []);
 
   return (
-    <div className="sos-button-container" ref={menuRef}>
+    <div
+      className="sos-button-container"
+      ref={menuRef}
+      onMouseEnter={handleMouseEnter}
+      onMouseLeave={handleMouseLeave}
+    >
       <button
         onClick={handleSOSClick}
         className="sos-button"

@@ -1,7 +1,7 @@
 import { Link, useNavigate } from 'react-router-dom';
 import HomeLink from '../components/HomeLink';
 import logo2 from '../assets/MediVise2.png';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { WordRotate } from '../components/WordRotate';
 import Ripple from '../components/Ripple';
 import ShineBorder from '../components/ShineBorder';
@@ -30,6 +30,8 @@ export default function Home() {
   const [firstName, setFirstName] = useState('');
   const [lastName, setLastName] = useState('');
   const [username, setUsername] = useState('');
+  const [usernameError, setUsernameError] = useState<string | null>(null);
+  const [checkingUsername, setCheckingUsername] = useState(false);
   const [confirm, setConfirm] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -60,6 +62,8 @@ export default function Home() {
     setLoading(true); setError(null);
     try {
       if (password !== confirm) throw new Error('Passwords do not match');
+      if (!username || username.length < 3) throw new Error('Username must be at least 3 characters');
+      if (usernameError) throw new Error('Username is already taken');
       
       // Create Firebase user first
       await signUpWithEmail(signupEmail, password, username);
@@ -135,14 +139,52 @@ export default function Home() {
     } finally { setLoading(false); }
   }
 
+  // Debounced username availability check for signup
+  useEffect(() => {
+    const t = setTimeout(async () => {
+      if (mode !== 'signup') { setUsernameError(null); return; }
+      const clean = username.trim();
+      if (!clean) { setUsernameError(null); return; }
+      if (clean.length < 3) { setUsernameError('Username must be at least 3 characters'); return; }
+      setCheckingUsername(true);
+      try {
+        const res = await fetch(`http://127.0.0.1:8000/public/check-username/${encodeURIComponent(clean)}`);
+        const data = await res.json();
+        setUsernameError(data.available ? null : 'Username is already taken');
+      } catch (_e) {
+        setUsernameError(null);
+      } finally {
+        setCheckingUsername(false);
+      }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [username, mode]);
+
   return (
     <div className="stage-container home-stage">
       <Ripple />
       {/* Navigation */}
       <nav className="stage-nav">
         <div className="nav-links">
-          <HomeLink className="nav-link active">Home</HomeLink>
-          <Link to="/about" className="nav-link">About</Link>
+          <HomeLink className="nav-link active">
+            <span className="nav-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                <polyline points="9,22 9,12 15,12 15,22" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+            </span>
+            <span className="nav-text">Home</span>
+            <span className="nav-tooltip">Home</span>
+          </HomeLink>
+          <Link to="/about" className="nav-link">
+            <span className="nav-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+            </span>
+            <span className="nav-text">About</span>
+            <span className="nav-tooltip">About</span>
+          </Link>
         </div>
       </nav>
 
@@ -201,7 +243,7 @@ export default function Home() {
                       {showPwd ? 'Hide' : 'Show'}
                     </button>
                   </div>
-                  {error && <p className="small" style={{ color: '#fca5a5', margin: 0 }}>{error}</p>}
+                  {error && <p className="small" style={{ color: '#dc2626', margin: 0, fontWeight: '600' }}>{error}</p>}
                   <div className="cta-row">
                     <button className="auth-btn primary" type="submit" disabled={loading}>{loading ? 'Signing in...' : 'Sign In'}</button>
                     <button type="button" className="auth-btn secondary" onClick={() => setMode('none')}>Cancel</button>
@@ -223,6 +265,15 @@ export default function Home() {
                   <div className="field">
                     <label className="small">Username</label>
                     <input className="input boxed" value={username} onChange={(e) => setUsername(e.target.value)} type="text" placeholder="username" required />
+                    {checkingUsername && (
+                      <span className="small" style={{ color: 'var(--muted)', marginTop: 2 }}>Checking...</span>
+                    )}
+                    {!checkingUsername && usernameError && (
+                      <span className="small" style={{ color: '#dc2626', marginTop: 2, fontWeight: '600' }}>{usernameError}</span>
+                    )}
+                    {!checkingUsername && !usernameError && username.trim().length >= 3 && (
+                      <span className="small" style={{ color: '#10b981', marginTop: 2 }}>✓ Username is available</span>
+                    )}
                   </div>
                   <div className="field">
                     <label className="small">First Name</label>
@@ -250,9 +301,9 @@ export default function Home() {
                       {showConfirmPwd ? 'Hide' : 'Show'}
                     </button>
                   </div>
-                  {error && <p className="small" style={{ color: '#fca5a5', margin: 0 }}>{error}</p>}
+                  {error && <p className="small" style={{ color: '#dc2626', margin: 0, fontWeight: '600' }}>{error}</p>}
                   <div className="cta-row">
-                    <button className="auth-btn primary" type="submit" disabled={loading}>{loading ? 'Creating...' : 'Create Account'}</button>
+                    <button className="auth-btn primary" type="submit" disabled={loading || checkingUsername || !!usernameError}>{loading ? 'Creating...' : 'Create Account'}</button>
                     <button type="button" className="auth-btn secondary" onClick={() => setMode('none')}>Cancel</button>
                   </div>
                   <button type="button" className="auth-btn google" onClick={onGoogle} disabled={loading} aria-label="Continue with Google">

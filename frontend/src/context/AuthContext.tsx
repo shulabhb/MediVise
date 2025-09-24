@@ -26,21 +26,67 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => unsub();
   }, []);
 
+  function mapFirebaseError(err: any): string {
+    const code = err?.code || '';
+    switch (code) {
+      case 'auth/invalid-credential':
+      case 'auth/wrong-password':
+        return 'Incorrect email/username or password.';
+      case 'auth/user-not-found':
+        return 'No account found with those credentials.';
+      case 'auth/too-many-requests':
+        return 'Too many attempts. Please try again later.';
+      case 'auth/network-request-failed':
+        return 'Network error. Check your connection and try again.';
+      case 'auth/email-already-in-use':
+        return 'That email is already in use. Try logging in.';
+      case 'auth/invalid-email':
+        return 'Please enter a valid email address.';
+      case 'auth/weak-password':
+        return 'Password is too weak. Please use at least 6 characters.';
+      default:
+        return err?.message?.replace(/^Firebase:\s*/i, '') || 'Something went wrong. Please try again.';
+    }
+  }
+
   const value = useMemo<AuthContextValue>(() => ({
     user,
     loading,
-    async signInWithEmail(email, password) {
-      await signInWithEmailAndPassword(auth, email, password);
+    async signInWithEmail(emailOrUsername, password) {
+      try {
+        let ident = emailOrUsername;
+        // If it doesn't look like an email, try resolving as username via backend
+        if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(emailOrUsername)) {
+          try {
+            const r = await fetch(`http://127.0.0.1:8000/public/resolve-username/${encodeURIComponent(emailOrUsername)}`);
+            if (r.ok) {
+              const data = await r.json();
+              if (data?.email) ident = data.email;
+            }
+          } catch { /* fallback to original */ }
+        }
+        await signInWithEmailAndPassword(auth, ident, password);
+      } catch (e: any) {
+        throw new Error(mapFirebaseError(e));
+      }
     },
     async signUpWithEmail(email, password, _username) {
-      const cred = await createUserWithEmailAndPassword(auth, email, password);
-      // Best-effort: set displayName to provided username for consistency
-      if (_username && cred.user) {
-        try { await updateProfile(cred.user, { displayName: _username }); } catch {}
+      try {
+        const cred = await createUserWithEmailAndPassword(auth, email, password);
+        // Best-effort: set displayName to provided username for consistency
+        if (_username && cred.user) {
+          try { await updateProfile(cred.user, { displayName: _username }); } catch {}
+        }
+      } catch (e: any) {
+        throw new Error(mapFirebaseError(e));
       }
     },
     async signInWithGoogle() {
-      await signInWithPopup(auth, googleProvider);
+      try {
+        await signInWithPopup(auth, googleProvider);
+      } catch (e: any) {
+        throw new Error(mapFirebaseError(e));
+      }
     },
     async logout() {
       await signOut(auth);

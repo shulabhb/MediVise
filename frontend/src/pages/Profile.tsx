@@ -1,11 +1,7 @@
 import { useAuth } from '../context/AuthContext';
 import { useState, useEffect } from 'react';
 import type { FormEvent } from 'react';
-import { Link } from 'react-router-dom';
-import HomeLink from '../components/HomeLink';
-import logo2 from '../assets/MediVise2.png';
-import UserMenu from '../components/UserMenu';
-import SOSButton from '../components/SOSButton';
+import LoggedInNavbar from '../components/LoggedInNavbar';
 import { updatePassword, EmailAuthProvider, reauthenticateWithCredential, getAuth, sendPasswordResetEmail, updateProfile } from 'firebase/auth';
 
 interface UserProfile {
@@ -74,8 +70,8 @@ export default function Profile() {
             body: JSON.stringify({
               username: user.displayName || user.email?.split('@')[0] || 'user',
               email: user.email || '',
-              first_name: '',
-              last_name: '',
+              first_name: (user.displayName ? user.displayName.split(' ')[0] : '') || '',
+              last_name: (user.displayName ? user.displayName.split(' ').slice(1).join(' ') : '') || '',
               date_of_birth: '',
             }),
           });
@@ -115,7 +111,7 @@ export default function Profile() {
 
     setCheckingUsername(true);
     try {
-      const response = await fetch(`http://127.0.0.1:8000/users/check-username/${usernameToCheck}`);
+      const response = await fetch(`http://127.0.0.1:8000/public/check-username/${encodeURIComponent(usernameToCheck)}`);
       const data = await response.json();
       
       if (!data.available) {
@@ -213,18 +209,31 @@ export default function Profile() {
 
   async function deleteAccount() {
     if (!confirm('Are you sure you want to permanently delete your account? This cannot be undone.')) return;
+    setLoading(true);
     try {
       const token = await user?.getIdToken();
       if (!token) throw new Error('Not authenticated');
+      
+      // Delete backend profile
       const res = await fetch('http://127.0.0.1:8000/users/me', {
         method: 'DELETE',
         headers: { 'Authorization': `Bearer ${token}` },
       });
-      if (!res.ok) throw new Error('Failed to delete account');
-      await logout();
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.detail || 'Failed to delete account');
+      }
+      
+      // Delete Firebase user
+      await user.delete();
+      
+      // Redirect to home page
       window.location.href = '/';
     } catch (err: any) {
-      alert(err?.message || 'Failed to delete account');
+      setError(err?.message || 'Failed to delete account');
+      console.error('Delete account error:', err);
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -246,21 +255,9 @@ export default function Profile() {
   }
 
   return (
-    <div className="dashboard-page">
+    <div className="dashboard-page profile-page">
       {/* Top Navigation - consistent */}
-      <Link to="/about">
-        <img src={logo2} alt="MediVise" className="nav-logo-small" />
-      </Link>
-      <nav className="stage-nav">
-        <div className="nav-links">
-          <HomeLink className="nav-link">Dashboard</HomeLink>
-          <Link to="/chat" className="nav-link">Chat</Link>
-          <Link to="/medications" className="nav-link">Medications</Link>
-          <Link to="/appointments" className="nav-link">Appointments</Link>
-          <SOSButton />
-          <UserMenu />
-        </div>
-      </nav>
+      <LoggedInNavbar />
 
       {/* Main Content */}
       <div className="dashboard-content">
@@ -268,17 +265,15 @@ export default function Profile() {
         <div style={{ display: 'grid', gridTemplateColumns: '300px 1fr', gap: '2rem', alignItems: 'start', width: 'min(1100px, 94vw)', margin: '0 auto' }}>
           {/* Avatar + quick actions */}
           <div style={{ display: 'grid', justifyItems: 'center', gap: '1rem' }}>
-            <div style={{ width: 220, height: 220, borderRadius: '50%', display: 'grid', placeItems: 'center', background: 'rgba(255,255,255,0.08)', border: '2px solid rgba(255,255,255,0.22)', boxShadow: '0 16px 44px rgba(0,0,0,0.35)' }}>
-              <div style={{ width: 80, height: 80, borderRadius: '50%', background: 'linear-gradient(135deg, #8b5a8b, #6a4c93)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white', fontSize: '2rem', fontWeight: 'bold' }}>
-                {profile?.username?.charAt(0).toUpperCase() || 'U'}
-              </div>
+            <div style={{ width: 80, height: 80, borderRadius: '50%', background: 'linear-gradient(135deg, #8b5a8b, #6a4c93)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'white', fontSize: '2rem', fontWeight: 'bold' }}>
+              {profile?.username?.charAt(0).toUpperCase() || 'U'}
             </div>
             <div style={{ textAlign: 'center' }}>
               <h2 style={{ margin: '0 0 6px 0', color: 'rgb(229, 103, 54)' }}>{profile?.username || user?.displayName || user?.email?.split('@')[0] || 'User'}</h2>
               <p style={{ margin: 0, color: 'var(--muted)' }}>{email}</p>
             </div>
             <div style={{ display: 'flex', gap: 10 }}>
-              <button className="button subtle" onClick={async() => { if (!user?.email) return; try { await sendPasswordResetEmail(getAuth(), user.email); alert('Password reset email sent.'); } catch (e:any) { alert(e?.message || 'Failed to send reset email'); } }}>
+              <button className="button subtle" style={{ background: 'rgba(255,255,255,0.95)', color: '#111', borderColor: 'rgba(0,0,0,0.2)' }} onClick={async() => { if (!user?.email) return; try { await sendPasswordResetEmail(getAuth(), user.email); alert('Password reset email sent.'); } catch (e:any) { alert(e?.message || 'Failed to send reset email'); } }}>
                 Forgot password
               </button>
             </div>
@@ -293,10 +288,25 @@ export default function Profile() {
                 <form onSubmit={onSubmit} className="form-grid" style={{ marginBottom: 8 }}>
                   <div id="username-field">
                     <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                      <label className="small" style={{ color: '#e5e7eb', fontWeight: 600 }}>Username</label>
+                      <label className="small" style={{ color: '#3b0764', fontWeight: 600 }}>Username</label>
                       {!isEditingUsername && (
-                        <button type="button" className="button subtle" onClick={() => setIsEditingUsername(true)}>
-                          Edit
+                        <button
+                          type="button"
+                          aria-label="Edit username"
+                          onClick={() => setIsEditingUsername(true)}
+                          style={{
+                            background: 'transparent',
+                            border: 'none',
+                            padding: 6,
+                            display: 'grid',
+                            placeItems: 'center',
+                            cursor: 'pointer'
+                          }}
+                        >
+                          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M4 21h4l11-11-4-4L4 17v4z" fill="#0a0a0a"/>
+                            <path d="M14 3l4 4" stroke="#0a0a0a" strokeWidth="2" strokeLinecap="round"/>
+                          </svg>
                         </button>
                       )}
                     </div>
@@ -316,21 +326,29 @@ export default function Profile() {
                         </button>
                       </div>
                     )}
-                    {usernameError && (<p style={{ color: '#fca5a5', margin: '6px 0 0 0', fontSize: '0.9rem' }}>{usernameError}</p>)}
-                    {!usernameError && isEditingUsername && username && username.length >= 3 && (<p style={{ color: '#10b981', margin: '6px 0 0 0', fontSize: '0.9rem', fontWeight: 600 }}>✓ Username is available</p>)}
+                    {usernameError && (
+                      <p style={{ color: '#b91c1c', margin: '6px 0 0 0', fontSize: '0.95rem', fontWeight: 700 }}>
+                        {usernameError}
+                      </p>
+                    )}
+                    {!usernameError && isEditingUsername && username && username.length >= 3 && (
+                      <p style={{ color: '#059669', margin: '6px 0 0 0', fontSize: '0.95rem', fontWeight: 700 }}>
+                        ✓ Username is available
+                      </p>
+                    )}
                   </div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
                     <div>
-                      <label className="small" style={{ color: '#e5e7eb', fontWeight: 600 }}>First Name</label>
-                      <input className="input" value={firstName || ''} type="text" disabled placeholder="first name" />
+                      <label className="small" style={{ color: '#3b0764', fontWeight: 600 }}>First Name</label>
+                      <input className="input" value={firstName || ''} type="text" disabled />
                     </div>
                     <div>
-                      <label className="small" style={{ color: '#e5e7eb', fontWeight: 600 }}>Last Name</label>
-                      <input className="input" value={lastName || ''} type="text" disabled placeholder="last name" />
+                      <label className="small" style={{ color: '#3b0764', fontWeight: 600 }}>Last Name</label>
+                      <input className="input" value={lastName || ''} type="text" disabled />
                     </div>
                   </div>
                   <div>
-                    <label className="small" style={{ color: '#e5e7eb', fontWeight: 600 }}>Email</label>
+                    <label className="small" style={{ color: '#3b0764', fontWeight: 600 }}>Email</label>
                     <input className="input" value={email} type="email" disabled placeholder="email" />
                   </div>
                   {error && <p style={{ color: '#fca5a5', margin: '8px 0 0 0' }}>{error}</p>}
@@ -338,12 +356,12 @@ export default function Profile() {
                 </form>
 
                 <div>
-                  <h3 style={{ margin: '0 0 8px 0', color: '#e5e7eb' }}>Change Password</h3>
+                  <h3 style={{ margin: '0 0 8px 0', color: '#3b0764' }}>Change Password</h3>
                   <form onSubmit={onChangePassword} className="form-grid" style={{ marginBottom: 8 }}>
-                    <div className="field"><label className="small" style={{ color: '#e5e7eb', fontWeight: 600 }}>Current Password</label><input className="input" type="password" value={currentPwd} onChange={(e) => setCurrentPwd(e.target.value)} placeholder="current password" required /></div>
-                    <div className="field"><label className="small" style={{ color: '#e5e7eb', fontWeight: 600 }}>New Password</label><input className="input" type="password" value={newPwd} onChange={(e) => setNewPwd(e.target.value)} placeholder="new password" required /></div>
-                    <div className="field"><label className="small" style={{ color: '#e5e7eb', fontWeight: 600 }}>Confirm New Password</label><input className="input" type="password" value={confirmPwd} onChange={(e) => setConfirmPwd(e.target.value)} placeholder="confirm new password" required /></div>
-                    <div className="cta-row" style={{ justifyContent: 'flex-start' }}><button className="button subtle" type="submit">Update Password</button></div>
+                    <div className="field"><label className="small" style={{ color: '#3b0764', fontWeight: 600 }}>Current Password</label><input className="input" type="password" value={currentPwd} onChange={(e) => setCurrentPwd(e.target.value)} placeholder="current password" required /></div>
+                    <div className="field"><label className="small" style={{ color: '#3b0764', fontWeight: 600 }}>New Password</label><input className="input" type="password" value={newPwd} onChange={(e) => setNewPwd(e.target.value)} placeholder="new password" required /></div>
+                    <div className="field"><label className="small" style={{ color: '#3b0764', fontWeight: 600 }}>Confirm New Password</label><input className="input" type="password" value={confirmPwd} onChange={(e) => setConfirmPwd(e.target.value)} placeholder="confirm new password" required /></div>
+                    <div className="cta-row" style={{ justifyContent: 'flex-start' }}><button className="button subtle" type="submit" style={{ background: 'rgba(255,255,255,0.95)', color: '#111', borderColor: 'rgba(0,0,0,0.2)' }}>Update Password</button></div>
                   </form>
                 </div>
 
@@ -355,7 +373,9 @@ export default function Profile() {
                     <div className="info-item"><span className="info-label">Last Sign In:</span><span className="info-value">{user?.metadata?.lastSignInTime ? new Date(user.metadata.lastSignInTime).toLocaleDateString() : 'N/A'}</span></div>
                   </div>
                   <div className="cta-row" style={{ marginTop: 14, justifyContent: 'flex-start' }}>
-                    <button className="button" onClick={deleteAccount} style={{ background: 'rgba(189, 44, 44, 0.8)', borderColor: 'rgba(246, 242, 242, 0.8)', color: '#fff' }}>Delete Account</button>
+                    <button className="button" onClick={deleteAccount} disabled={loading} style={{ background: '#0a0a0a', borderColor: 'rgba(255,255,255,0.25)', color: '#fff' }}>
+                      {loading ? 'Deleting...' : 'Delete Account'}
+                    </button>
                   </div>
                 </div>
               </>
