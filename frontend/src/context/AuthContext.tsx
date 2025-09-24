@@ -7,7 +7,7 @@ type AuthContextValue = {
   user: User | null;
   loading: boolean;
   signInWithEmail: (email: string, password: string) => Promise<void>;
-  signUpWithEmail: (email: string, password: string) => Promise<void>;
+  signUpWithEmail: (email: string, password: string, username?: string) => Promise<void>;
   signInWithGoogle: () => Promise<void>;
   logout: () => Promise<void>;
 };
@@ -32,7 +32,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     async signInWithEmail(email, password) {
       await signInWithEmailAndPassword(auth, email, password);
     },
-    async signUpWithEmail(email, password) {
+    async signUpWithEmail(email, password, _username) {
       await createUserWithEmailAndPassword(auth, email, password);
     },
     async signInWithGoogle() {

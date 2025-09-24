@@ -5,7 +5,7 @@ import banner from '../assets/Banner.png';
 import Typewriter from '../components/Typewriter';
 import DisclaimerCarousel from '../components/DisclaimerCarousel';
 
-export default function About() {
+export default function AboutNew() {
   return (
     <div className="stage-container">
       {/* Navigation */}
@@ -149,7 +149,7 @@ export default function About() {
               ),
               body: (
                 <>
-                  <p><strong>MediVise explains—doesn't prescribe.</strong> Information provided is for understanding and education only.</p>
+                  <p><strong>MediVise explains—doesn’t prescribe.</strong> Information provided is for understanding and education only.</p>
                   <p>For diagnosis, treatment, emergencies, or medication questions, consult a licensed healthcare professional.</p>
                 </>
               ),
@@ -165,5 +165,3 @@ export default function About() {
     </div>
   );
 }
-
-
