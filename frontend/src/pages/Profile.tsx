@@ -225,7 +225,9 @@ export default function Profile() {
       }
       
       // Delete Firebase user
-      await user.delete();
+      if (user) {
+        await user.delete();
+      }
       
       // Redirect to home page
       window.location.href = '/';
