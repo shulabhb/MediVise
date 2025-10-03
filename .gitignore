@@ -1,6 +1,117 @@
+# Dependencies
+node_modules/
+backend/.venv/
+backend/venv/
+backend/env/
+backend/__pycache__/
+backend/app/__pycache__/
+backend/*.pyc
+backend/*.pyo
+backend/*.pyd
+backend/.Python
+backend/pip-log.txt
+backend/pip-delete-this-directory.txt
 
-# Ignore service accounts and env files
-backend/secrets/
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
 backend/.env
-**/*.pem
-**/*.p12
+backend/.env.local
+
+# Database files
+backend/*.db
+backend/*.sqlite
+backend/*.sqlite3
+backend/medivise.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build outputs
+dist/
+build/
+*.tgz
+*.tar.gz
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# Firebase
+backend/secrets/
+firebase-debug.log
+firebase-debug.*.log
+
+# Coverage reports
+coverage/
+*.lcov
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Microbundle cache
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# parcel-bundler cache (https://parceljs.org/)
+.cache
+.parcel-cache
+
+# Next.js build output
+.next
+
+# Nuxt.js build / generate output
+.nuxt
+dist
+
+# Storybook build outputs
+.out
+.storybook-out
+
+# Temporary folders
+tmp/
+temp/
