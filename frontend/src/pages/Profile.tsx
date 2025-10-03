@@ -33,13 +33,13 @@ export default function Profile() {
   const [newPwd, setNewPwd] = useState('');
   const [confirmPwd, setConfirmPwd] = useState('');
 
-  // Fetch user profile on component mount
+  // Fetch user profile when auth state is ready
   useEffect(() => {
     fetchUserProfile();
-  }, []);
+  }, [user]);
 
   async function fetchUserProfile() {
-    if (!user) return;
+    if (!user) { setFetching(false); return; }
     
     try {
       const token = await user.getIdToken();

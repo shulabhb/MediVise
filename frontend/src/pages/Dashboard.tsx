@@ -166,7 +166,7 @@ export default function Dashboard() {
                 </div>
               </div>
             }
-            onClick={() => navigate('/chat')}
+            onClick={() => navigate('/chat?new=1')}
           />
           
           <BentoCard
@@ -192,7 +192,7 @@ export default function Dashboard() {
                 </div>
               </div>
             }
-            onClick={() => navigate('/chat')}
+            onClick={() => navigate('/chat?new=1')}
           />
           
           <BentoCard

@@ -26,6 +26,34 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => unsub();
   }, []);
 
+  // Ensure backend profile exists immediately after login
+  useEffect(() => {
+    async function ensureBackendProfile() {
+      if (!user) return;
+      try {
+        const token = await user.getIdToken();
+        const username = user.displayName || user.email?.split('@')[0] || 'user';
+        await fetch('http://127.0.0.1:8000/users', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            username,
+            email: user.email || '',
+            first_name: '',
+            last_name: '',
+            date_of_birth: '',
+          }),
+        }).catch(() => {});
+      } catch {
+        // no-op; dashboard has fallback creation too
+      }
+    }
+    ensureBackendProfile();
+  }, [user]);
+
   function mapFirebaseError(err: any): string {
     const code = err?.code || '';
     switch (code) {
