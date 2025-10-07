@@ -110,15 +110,36 @@ export default function Chat() {
     init();
   }, [user]);
 
-  // If navigated with ?new=1, create a fresh conversation and clear the flag
+  // If navigated with ?new=1, create a fresh conversation and attach a document if provided
   useEffect(() => {
     const params = new URLSearchParams(location.search);
     const createNew = params.get('new') === '1';
+    const docId = params.get('docId');
     if (createNew) {
-      createNewConversation();
+      (async () => {
+        await createNewConversation();
+        if (docId) {
+          try {
+            // Fetch document metadata so we can attach proper info
+            const doc = await fetchWithAuth(`/documents/${docId}`);
+            const docInfo = {
+              id: docId,
+              name: doc?.filename || `Document ${docId}`,
+              type: 'application/pdf',
+              url: `${BASE_URL}/documents/${docId}/file`,
+            };
+            setNewMessage('Ask about this document...');
+            sessionStorage.setItem('chat_attached_doc', JSON.stringify(docInfo));
+          } catch (e) {
+            console.warn('Failed to load document for chat attach:', e);
+            setNewMessage('Ask about this document...');
+          }
+        }
+      })();
       // Remove the query param from the URL without reloading
       const url = new URL(window.location.href);
       url.searchParams.delete('new');
+      url.searchParams.delete('docId');
       window.history.replaceState({}, '', url.toString());
     }
   }, [location.search]);
@@ -185,29 +206,60 @@ export default function Chat() {
   };
 
   const handleFileUpload = async (file: File) => {
-    if (!file.type.includes('pdf')) {
-      alert('Please select a PDF file');
-      return;
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const res = await fetch(`${BASE_URL}/api/ocr/ingest?lang=eng`, {
+        method: 'POST',
+        body: form,
+      });
+      if (!res.ok) {
+        let detail = '';
+        try {
+          const err = await res.json();
+          detail = err?.detail || '';
+        } catch {}
+        throw new Error(`OCR failed: ${res.status}${detail ? ' - ' + detail : ''}`);
+      }
+      const data = await res.json();
+      if (!data?.full_text) {
+        throw new Error(data?.error || 'No text extracted');
+      }
+
+      // Save to Documents service as well
+      const docForm = new FormData();
+      docForm.append('file', file);
+      const docRes = await fetch(`${BASE_URL}/documents/upload`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${await user?.getIdToken()}` },
+        body: docForm,
+      });
+      if (!docRes.ok) {
+        console.warn('Document save failed:', docRes.status);
+      }
+
+      const userDocMsg: Message = {
+        id: `${Date.now()}-u`,
+        text: `Uploaded document: ${file.name}`,
+        sender: 'user',
+        timestamp: new Date(),
+        document: { name: file.name, type: file.type }
+      };
+      await addMessageToConversation(userDocMsg, { suppressAssistant: true });
+
+      const ocrMsg: Message = {
+        id: `${Date.now()}-a`,
+        text: data.full_text,
+        sender: 'assistant',
+        timestamp: new Date()
+      };
+      await addMessageToConversation(ocrMsg, { suppressAssistant: true });
+    } catch (e) {
+      console.error('OCR upload failed:', e);
+      alert('Failed to process document. Please try again.');
+    } finally {
+      setShowDocumentUpload(false);
     }
-
-    // Here you would typically upload to your backend
-    // For now, we'll simulate document processing
-    const document = {
-      name: file.name,
-      type: file.type,
-      url: URL.createObjectURL(file)
-    };
-
-    const documentMessage: Message = {
-      id: Date.now().toString(),
-      text: `Uploaded document: ${file.name}`,
-      sender: 'user',
-      timestamp: new Date(),
-      document
-    };
-
-    await addMessageToConversation(documentMessage);
-    setShowDocumentUpload(false);
   };
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -230,7 +282,7 @@ export default function Chat() {
     }
   };
 
-  const addMessageToConversation = async (message: Message) => {
+  const addMessageToConversation = async (message: Message, opts?: { suppressAssistant?: boolean }) => {
     if (!selectedConversation) return;
     try {
       const resp = await fetchWithAuth('/chat/message', {
@@ -239,6 +291,8 @@ export default function Chat() {
           conversationId: selectedConversation,
           message: message.text,
           document: message.document ? { filename: message.document.name, content: '', documentType: message.document.type } : undefined,
+          sender: message.sender,
+          suppressAssistant: Boolean(opts?.suppressAssistant),
         })
       });
       const updated = resp.conversation as any;
@@ -255,11 +309,23 @@ export default function Chat() {
   const handleSendMessage = async () => {
     if (!newMessage.trim() || !selectedConversation) return;
 
+    // attach document from session if present on the first send
+    let attachedDoc: Message['document'] | undefined;
+    const raw = sessionStorage.getItem('chat_attached_doc');
+    if (raw) {
+      try {
+        const parsed = JSON.parse(raw);
+        attachedDoc = { name: parsed.name, type: parsed.type, url: parsed.url };
+      } catch {}
+      sessionStorage.removeItem('chat_attached_doc');
+    }
+
     const message: Message = {
       id: Date.now().toString(),
       text: newMessage,
       sender: 'user',
-      timestamp: new Date()
+      timestamp: new Date(),
+      document: attachedDoc,
     };
 
     await addMessageToConversation(message);
@@ -429,9 +495,9 @@ export default function Chat() {
                     </div>
                   </div>
                 )}
-                {messages.map((message) => (
+                {messages.map((message, idx) => (
                   <div
-                    key={message.id}
+                    key={`${message.id || 'msg'}-${idx}`}
                     className={`message ${message.sender}`}
                   >
                     <div className="message-meta">

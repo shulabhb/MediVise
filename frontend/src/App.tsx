@@ -6,6 +6,7 @@ import About from './pages/About'
 import Dashboard from './pages/Dashboard'
 import Profile from './pages/Profile'
 import Documents from './pages/Documents'
+import PdfViewer from './pages/PdfViewer'
 import Chat from './pages/Chat'
 import Medications from './pages/Medications'
 import Appointments from './pages/Appointments'
@@ -50,6 +51,14 @@ export default function App() {
             element={
               <ProtectedRoute>
                 <Documents />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/documents/view/:id"
+            element={
+              <ProtectedRoute>
+                <PdfViewer />
               </ProtectedRoute>
             }
           />

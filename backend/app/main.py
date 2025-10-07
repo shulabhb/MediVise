@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
@@ -11,7 +12,8 @@ import json
 from .auth import get_current_user
 from .database import get_db, create_tables, engine
 from sqlalchemy import text
-from .models import User, Conversation, Message as MessageModel, Document
+from .models import User, Conversation, Message as MessageModel
+from .models_ocr import DocumentPage
 
 app = FastAPI(title="MediVise API", version="0.1.0")
 
@@ -22,6 +24,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Include OCR router
+from .routers_ocr import router as ocr_router
+app.include_router(ocr_router)
 
 @app.on_event("startup")
 def startup_event():
@@ -75,10 +81,15 @@ class DocumentUpload(BaseModel):
     content: str
     documentType: str
 
+class DocumentUpdate(BaseModel):
+    filename: Optional[str] = None
+
 class ChatMessage(BaseModel):
     message: str
     conversationId: Optional[str] = None
     document: Optional[DocumentUpload] = None
+    sender: Optional[str] = None  # 'user' or 'assistant'
+    suppressAssistant: Optional[bool] = False
 
 class ConversationUpdate(BaseModel):
     title: Optional[str] = None
@@ -311,22 +322,26 @@ async def send_chat_message(chat_message: ChatMessage, current_user: dict = Depe
         db.commit()
         db.refresh(conv)
 
-    # Add user message
-    user_msg = MessageModel(
+    # Add message with provided sender (default to user)
+    msg_sender = (chat_message.sender or "user").lower()
+    if msg_sender not in ("user", "assistant"):
+        raise HTTPException(status_code=400, detail="Invalid sender")
+    db_msg = MessageModel(
         text=chat_message.message,
-        sender="user",
+        sender=msg_sender,
         conversation_id=conv.id,
         document_data=chat_message.document.dict() if chat_message.document else None,
     )
-    db.add(user_msg)
+    db.add(db_msg)
 
-    # Simulated assistant response
-    ai_msg = MessageModel(
-        text="I'm here to help! This is a simulated response. In a real implementation, this would connect to your AI service.",
-        sender="assistant",
-        conversation_id=conv.id,
-    )
-    db.add(ai_msg)
+    # Only add simulated assistant reply for true user messages when not suppressed
+    if msg_sender == "user" and not chat_message.suppressAssistant:
+        ai_msg = MessageModel(
+            text="I'm here to help! This is a simulated response. In a real implementation, this would connect to your AI service.",
+            sender="assistant",
+            conversation_id=conv.id,
+        )
+        db.add(ai_msg)
 
     # Update conversation
     conv.last_message = chat_message.message
@@ -479,6 +494,38 @@ async def get_document(document_id: str, current_user: dict = Depends(get_curren
         raise HTTPException(status_code=403, detail="Access denied")
 
     return document
+
+@app.get("/documents/{document_id}/file")
+async def get_document_file(document_id: str, current_user: dict = Depends(get_current_user)):
+    """Stream the original PDF file for the given document id."""
+    user_id = current_user.get("uid")
+    if document_id not in documents_db:
+        raise HTTPException(status_code=404, detail="Document not found")
+    document = documents_db[document_id]
+    if document["userId"] != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    file_path = document.get("filePath")
+    if not file_path or not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path=file_path, media_type="application/pdf", filename=document.get("filename") or "document.pdf")
+
+@app.patch("/documents/{document_id}")
+async def update_document(document_id: str, payload: DocumentUpdate, current_user: dict = Depends(get_current_user)):
+    """Rename or update document metadata."""
+    user_id = current_user.get("uid")
+    if document_id not in documents_db:
+        raise HTTPException(status_code=404, detail="Document not found")
+    document = documents_db[document_id]
+    if document["userId"] != user_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    changed = False
+    if payload.filename is not None and payload.filename.strip():
+        document["filename"] = payload.filename.strip()
+        changed = True
+    if not changed:
+        return {"ok": True}
+    documents_db[document_id] = document
+    return {"ok": True, "document": document}
 
 @app.post("/sos-alert")
 async def send_sos_alert(alert_data: SOSAlert, current_user: dict = Depends(get_current_user)):
