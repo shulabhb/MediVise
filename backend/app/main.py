@@ -225,7 +225,7 @@ async def public_resolve_username(username: str, db: Session = Depends(get_db)):
         return {"email": user.email or ""}
     raise HTTPException(status_code=404, detail="Username not found")
 
-documents_db = {}
+# documents_db = {}  # Replaced with database storage
 
 @app.post("/chat/conversations")
 async def create_conversation(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -410,10 +410,12 @@ async def delete_conversation(conversation_id: str, current_user: dict = Depends
 @app.post("/documents/upload")
 async def upload_document(
     file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
     """Upload and parse a document"""
     user_id = current_user.get("uid")
+    user = _get_or_create_user(db, user_id, current_user.get("email", ""), current_user.get("email", "") or user_id)
 
     # Validate file type
     if not file.filename.lower().endswith('.pdf'):
@@ -444,21 +446,35 @@ async def upload_document(
             for page in pdf_reader.pages:
                 text_content += page.extract_text() + "\n"
 
-            # Store document info
+            # Store document info in database using OCR Document model
+            from .models_ocr import Document as OCRDocument
+            doc = OCRDocument(
+                filename=file.filename,
+                mime_type="application/pdf",
+                storage_path=file_path,
+                language_used="eng",
+                ocr_engine="pypdf2",
+                status="completed",
+                num_pages=len(pdf_reader.pages),
+                processing_ms=0,
+                full_text=text_content,
+            )
+            db.add(doc)
+            db.commit()
+            db.refresh(doc)
+
             document_info = {
-                "id": str(uuid.uuid4()),
-                "filename": file.filename,
-                "originalName": file.filename,
-                "filePath": file_path,
+                "id": str(doc.id),
+                "filename": doc.filename,
+                "originalName": doc.filename,
+                "filePath": doc.storage_path,
                 "fileSize": os.path.getsize(file_path),
                 "content": text_content[:1000],  # First 1000 chars for preview
                 "fullContent": text_content,
                 "documentType": "pdf",
-                "uploadDate": datetime.now(),
+                "uploadDate": doc.created_at.isoformat() if doc.created_at else datetime.now().isoformat(),
                 "userId": user_id
             }
-
-            documents_db[document_info["id"]] = document_info
 
             return {
                 "message": "Document uploaded and parsed successfully",
@@ -472,60 +488,127 @@ async def upload_document(
         raise HTTPException(status_code=500, detail=f"Error parsing PDF: {str(e)}")
 
 @app.get("/documents")
-async def get_documents(current_user: dict = Depends(get_current_user)):
+async def get_documents(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     """Get user's uploaded documents"""
     user_id = current_user.get("uid")
-    user_documents = [
-        doc for doc in documents_db.values()
-        if doc["userId"] == user_id
-    ]
+    user = _get_or_create_user(db, user_id, current_user.get("email", ""), current_user.get("email", "") or user_id)
+    
+    from .models_ocr import Document as OCRDocument
+    docs = db.query(OCRDocument).filter(OCRDocument.status == "completed").all()
+    
+    user_documents = []
+    for doc in docs:
+        user_documents.append({
+            "id": str(doc.id),
+            "filename": doc.filename,
+            "originalName": doc.filename,
+            "filePath": doc.storage_path,
+            "fileSize": os.path.getsize(doc.storage_path) if os.path.exists(doc.storage_path) else 0,
+            "content": doc.full_text[:1000] if doc.full_text else "",
+            "fullContent": doc.full_text or "",
+            "documentType": "pdf",
+            "uploadDate": doc.created_at.isoformat() if doc.created_at else datetime.now().isoformat(),
+            "userId": user_id
+        })
+    
     return user_documents
 
 @app.get("/documents/{document_id}")
-async def get_document(document_id: str, current_user: dict = Depends(get_current_user)):
+async def get_document(document_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     """Get a specific document"""
     user_id = current_user.get("uid")
-
-    if document_id not in documents_db:
+    user = _get_or_create_user(db, user_id, current_user.get("email", ""), current_user.get("email", "") or user_id)
+    
+    from .models_ocr import Document as OCRDocument
+    doc = db.query(OCRDocument).filter(OCRDocument.id == int(document_id)).first()
+    if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    document = documents_db[document_id]
-    if document["userId"] != user_id:
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    return document
+    return {
+        "id": str(doc.id),
+        "filename": doc.filename,
+        "originalName": doc.filename,
+        "filePath": doc.storage_path,
+        "fileSize": os.path.getsize(doc.storage_path) if os.path.exists(doc.storage_path) else 0,
+        "content": doc.full_text[:1000] if doc.full_text else "",
+        "fullContent": doc.full_text or "",
+        "documentType": "pdf",
+        "uploadDate": doc.created_at.isoformat() if doc.created_at else datetime.now().isoformat(),
+        "userId": user_id
+    }
 
 @app.get("/documents/{document_id}/file")
-async def get_document_file(document_id: str, current_user: dict = Depends(get_current_user)):
+async def get_document_file(document_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     """Stream the original PDF file for the given document id."""
     user_id = current_user.get("uid")
-    if document_id not in documents_db:
+    user = _get_or_create_user(db, user_id, current_user.get("email", ""), current_user.get("email", "") or user_id)
+    
+    from .models_ocr import Document as OCRDocument
+    doc = db.query(OCRDocument).filter(OCRDocument.id == int(document_id)).first()
+    if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    document = documents_db[document_id]
-    if document["userId"] != user_id:
-        raise HTTPException(status_code=403, detail="Access denied")
-    file_path = document.get("filePath")
+    
+    file_path = doc.storage_path
     if not file_path or not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path=file_path, media_type="application/pdf", filename=document.get("filename") or "document.pdf")
+    return FileResponse(path=file_path, media_type="application/pdf", filename=doc.filename or "document.pdf")
 
 @app.patch("/documents/{document_id}")
-async def update_document(document_id: str, payload: DocumentUpdate, current_user: dict = Depends(get_current_user)):
+async def update_document(document_id: str, payload: DocumentUpdate, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     """Rename or update document metadata."""
     user_id = current_user.get("uid")
-    if document_id not in documents_db:
+    user = _get_or_create_user(db, user_id, current_user.get("email", ""), current_user.get("email", "") or user_id)
+    
+    from .models_ocr import Document as OCRDocument
+    doc = db.query(OCRDocument).filter(OCRDocument.id == int(document_id)).first()
+    if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-    document = documents_db[document_id]
-    if document["userId"] != user_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    
     changed = False
     if payload.filename is not None and payload.filename.strip():
-        document["filename"] = payload.filename.strip()
+        doc.filename = payload.filename.strip()
         changed = True
-    if not changed:
-        return {"ok": True}
-    documents_db[document_id] = document
-    return {"ok": True, "document": document}
+    
+    if changed:
+        db.commit()
+        db.refresh(doc)
+    
+    return {"ok": True, "document": {
+        "id": str(doc.id),
+        "filename": doc.filename,
+        "originalName": doc.filename,
+        "filePath": doc.storage_path,
+        "fileSize": os.path.getsize(doc.storage_path) if os.path.exists(doc.storage_path) else 0,
+        "content": doc.full_text[:1000] if doc.full_text else "",
+        "fullContent": doc.full_text or "",
+        "documentType": "pdf",
+        "uploadDate": doc.created_at.isoformat() if doc.created_at else datetime.now().isoformat(),
+        "userId": user_id
+    }}
+
+@app.delete("/documents/{document_id}")
+async def delete_document(document_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Delete a document and its file."""
+    user_id = current_user.get("uid")
+    user = _get_or_create_user(db, user_id, current_user.get("email", ""), current_user.get("email", "") or user_id)
+    
+    from .models_ocr import Document as OCRDocument
+    doc = db.query(OCRDocument).filter(OCRDocument.id == int(document_id)).first()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Remove file if it exists
+    file_path = doc.storage_path
+    if file_path and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass  # Continue even if file deletion fails
+    
+    # Remove from database
+    db.delete(doc)
+    db.commit()
+    return {"ok": True}
 
 @app.post("/sos-alert")
 async def send_sos_alert(alert_data: SOSAlert, current_user: dict = Depends(get_current_user)):
