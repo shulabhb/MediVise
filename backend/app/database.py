@@ -3,6 +3,8 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import os
 from .models import Base
+# Import medication model to register it with Base metadata
+from .models_medication import Medication
 
 # Database URL - set via env
 # Examples:

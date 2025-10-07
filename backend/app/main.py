@@ -29,6 +29,10 @@ app.add_middleware(
 from .routers_ocr import router as ocr_router
 app.include_router(ocr_router)
 
+# Include Medications router
+from .routers.medications import router as medications_router
+app.include_router(medications_router)
+
 @app.on_event("startup")
 def startup_event():
     try:
