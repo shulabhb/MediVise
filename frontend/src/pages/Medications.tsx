@@ -3,11 +3,13 @@ import { Link } from 'react-router-dom';
 import LoggedInNavbar from '../components/LoggedInNavbar';
 import MedicationCard from '../components/MedicationCard';
 import MedicationFormModal from '../components/MedicationFormModal';
+import { useAuth } from '../context/AuthContext';
 import logo2 from '../assets/MediVise2.png';
 
 type Med = any;
 
 export default function Medications() {
+  const { user } = useAuth();
   const [items, setItems] = useState<Med[]>([]);
   const [filter, setFilter] = useState<"all"|"active"|"inactive">("all");
   const [open, setOpen] = useState(false);
@@ -16,11 +18,17 @@ export default function Medications() {
 
   const fetchData = async () => {
     try {
+      const token = await user?.getIdToken();
       const qs = filter === "all" ? "" : `?is_active=${filter === "active" ? "true":"false"}`;
       const url = `http://127.0.0.1:8000/api/medications${qs}`;
       console.log('Fetching medications from:', url);
       
-      const res = await fetch(url);
+      const res = await fetch(url, {
+        headers: {
+          'Authorization': token ? `Bearer ${token}` : '',
+          'Content-Type': 'application/json',
+        },
+      });
       if (!res.ok) {
         throw new Error(`Failed to fetch medications: ${res.status}`);
       }
@@ -34,14 +42,33 @@ export default function Medications() {
     }
   };
 
-  useEffect(() => { fetchData(); /* eslint-disable-next-line */ }, [filter]);
+  useEffect(() => { 
+    if (user) {
+      fetchData(); 
+    }
+    /* eslint-disable-next-line */ 
+  }, [filter, user]);
 
   const addNew = () => { setEditing(undefined); setOpen(true); };
   const onEdit = (m: Med) => { setEditing(m); setOpen(true); };
   const onDelete = async (m: Med) => {
     if (!confirm(`Delete ${m.name}?`)) return;
-    await fetch(`http://127.0.0.1:8000/api/medications/${m.id}`, { method: "DELETE" });
-    fetchData();
+    try {
+      const token = await user?.getIdToken();
+      const res = await fetch(`http://127.0.0.1:8000/api/medications/${m.id}`, { 
+        method: "DELETE",
+        headers: {
+          'Authorization': token ? `Bearer ${token}` : '',
+        },
+      });
+      if (!res.ok) {
+        throw new Error(`Delete failed: ${res.status}`);
+      }
+      fetchData();
+    } catch (error) {
+      console.error('Error deleting medication:', error);
+      alert('Failed to delete medication. Please try again.');
+    }
   };
 
   const submit = async (payload: any) => {
@@ -49,12 +76,18 @@ export default function Medications() {
     
     try {
       setIsSubmitting(true);
+      const token = await user?.getIdToken();
       console.log('Submitting medication:', payload);
+      
+      const headers = {
+        'Authorization': token ? `Bearer ${token}` : '',
+        'Content-Type': 'application/json',
+      };
       
       if (editing) {
         const response = await fetch(`http://127.0.0.1:8000/api/medications/${editing.id}`, {
           method: "PATCH",
-          headers: { "Content-Type": "application/json" },
+          headers,
           body: JSON.stringify(payload),
         });
         if (!response.ok) {
@@ -64,11 +97,13 @@ export default function Medications() {
       } else {
         const response = await fetch(`http://127.0.0.1:8000/api/medications`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers,
           body: JSON.stringify(payload),
         });
         if (!response.ok) {
-          throw new Error(`Create failed: ${response.status}`);
+          const errorData = await response.json();
+          console.error('API Error Response:', errorData);
+          throw new Error(`Create failed: ${response.status} - ${JSON.stringify(errorData)}`);
         }
         const result = await response.json();
         console.log('Medication created successfully:', result);

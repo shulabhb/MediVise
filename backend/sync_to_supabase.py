@@ -14,6 +14,9 @@ import json
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from app.models import Base, User, Conversation, Message, Document
+from app.models_medication import Medication
+from app.models_appointment import Appointment
+from app.models_ocr import OCRDocument, DocumentPage
 from app.database import get_db
 
 def sync_to_supabase():

@@ -207,10 +207,12 @@ export default function Chat() {
 
   const handleFileUpload = async (file: File) => {
     try {
+      const token = await user?.getIdToken();
       const form = new FormData();
       form.append('file', file);
       const res = await fetch(`${BASE_URL}/api/ocr/ingest?lang=eng`, {
         method: 'POST',
+        headers: { 'Authorization': token ? `Bearer ${token}` : '' },
         body: form,
       });
       if (!res.ok) {
@@ -237,13 +239,15 @@ export default function Chat() {
       if (!docRes.ok) {
         console.warn('Document save failed:', docRes.status);
       }
+      const docJson = await docRes.json().catch(() => null as any);
+      const savedDoc = (docJson && (docJson as any).document) || null;
 
       const userDocMsg: Message = {
         id: `${Date.now()}-u`,
         text: `Uploaded document: ${file.name}`,
         sender: 'user',
         timestamp: new Date(),
-        document: { name: file.name, type: file.type }
+        document: savedDoc ? { name: savedDoc.filename, type: savedDoc.documentType, url: `${BASE_URL}/documents/${savedDoc.id}/file` } : { name: file.name, type: file.type }
       };
       await addMessageToConversation(userDocMsg, { suppressAssistant: true });
 
@@ -289,6 +293,7 @@ export default function Chat() {
         method: 'POST',
         body: JSON.stringify({
           conversationId: selectedConversation,
+          conversation_id: selectedConversation,
           message: message.text,
           document: message.document ? { filename: message.document.name, content: '', documentType: message.document.type } : undefined,
           sender: message.sender,

@@ -14,24 +14,24 @@ const routes = ["po","sl","iv","im","topical","inh","other"];
 export default function MedicationFormModal({ open, onClose, initial, onSubmit, isSubmitting = false }: Props) {
   const [form, setForm] = useState<any>({
     name: "",
-    generic_name: "",
+    generic_name: null,
     dose_strength: "",
-    dose_form: "",
-    route: "",
+    dose_form: null,
+    route: null,
     frequency: "",
-    directions: "",
-    indication: "",
-    start_date: "",
-    end_date: "",
+    directions: null,
+    indication: null,
+    start_date: null,
+    end_date: null,
     is_active: true,
-    prescribing_provider: "",
-    pharmacy: "",
-    ndc_code: "",
+    prescribing_provider: null,
+    pharmacy: null,
+    ndc_code: null,
     refills_remaining: 0,
     total_refills: 0,
-    last_filled_date: "",
-    notes: "",
-    source_document_id: "",
+    last_filled_date: null,
+    notes: null,
+    source_document_id: null,
     reminder_enabled: false,
   });
 
@@ -40,48 +40,48 @@ export default function MedicationFormModal({ open, onClose, initial, onSubmit, 
       if (initial) {
         setForm({
           name: initial.name || "",
-          generic_name: initial.generic_name || "",
+          generic_name: initial.generic_name || null,
           dose_strength: initial.dose_strength || "",
-          dose_form: initial.dose_form || "",
-          route: initial.route || "",
+          dose_form: initial.dose_form || null,
+          route: initial.route || null,
           frequency: initial.frequency || "",
-          directions: initial.directions || "",
-          indication: initial.indication || "",
-          start_date: initial.start_date || "",
-          end_date: initial.end_date || "",
+          directions: initial.directions || null,
+          indication: initial.indication || null,
+          start_date: initial.start_date || null,
+          end_date: initial.end_date || null,
           is_active: initial.is_active ?? true,
-          prescribing_provider: initial.prescribing_provider || "",
-          pharmacy: initial.pharmacy || "",
-          ndc_code: initial.ndc_code || "",
+          prescribing_provider: initial.prescribing_provider || null,
+          pharmacy: initial.pharmacy || null,
+          ndc_code: initial.ndc_code || null,
           refills_remaining: initial.refills_remaining ?? 0,
           total_refills: initial.total_refills ?? 0,
-          last_filled_date: initial.last_filled_date || "",
-          notes: initial.notes || "",
-          source_document_id: initial.source_document_id || "",
+          last_filled_date: initial.last_filled_date || null,
+          notes: initial.notes || null,
+          source_document_id: initial.source_document_id || null,
           reminder_enabled: initial.reminder_enabled ?? false,
         });
       } else {
         // Reset form when no initial data
         setForm({
           name: "",
-          generic_name: "",
+          generic_name: null,
           dose_strength: "",
-          dose_form: "",
-          route: "",
+          dose_form: null,
+          route: null,
           frequency: "",
-          directions: "",
-          indication: "",
-          start_date: "",
-          end_date: "",
+          directions: null,
+          indication: null,
+          start_date: null,
+          end_date: null,
           is_active: true,
-          prescribing_provider: "",
-          pharmacy: "",
-          ndc_code: "",
+          prescribing_provider: null,
+          pharmacy: null,
+          ndc_code: null,
           refills_remaining: 0,
           total_refills: 0,
-          last_filled_date: "",
-          notes: "",
-          source_document_id: "",
+          last_filled_date: null,
+          notes: null,
+          source_document_id: null,
           reminder_enabled: false,
         });
       }
@@ -94,17 +94,19 @@ export default function MedicationFormModal({ open, onClose, initial, onSubmit, 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     const payload = { ...form };
-    // Convert empty strings to null for date fields, but keep other fields as empty strings
-    ["start_date","end_date","last_filled_date"].forEach(k => {
-      if (payload[k] === "") payload[k] = null;
-    });
-    // Ensure all string fields are never null
-    const stringFields = ["name", "generic_name", "dose_strength", "dose_form", "route", "frequency", "directions", "indication", "prescribing_provider", "pharmacy", "ndc_code", "notes"];
-    stringFields.forEach(field => {
-      if (payload[field] === null || payload[field] === undefined) {
-        payload[field] = "";
-      }
-    });
+    
+    // Ensure required fields are not empty
+    if (!payload.name || !payload.dose_strength || !payload.frequency) {
+      alert("Please fill in all required fields (Name, Dose Strength, Frequency)");
+      return;
+    }
+    
+    // Remove source_document_id if it's null (it's not used in the form)
+    if (payload.source_document_id === null) {
+      delete payload.source_document_id;
+    }
+    
+    console.log('Submitting payload:', payload);
     await onSubmit(payload);
     onClose();
   };
@@ -125,11 +127,11 @@ export default function MedicationFormModal({ open, onClose, initial, onSubmit, 
             <input required
               value={form.name} onChange={e=>set("name", e.target.value)} placeholder="Lipitor" />
           </label>
-          <label>
-            Generic name
-            <input
-              value={form.generic_name} onChange={e=>set("generic_name", e.target.value)} placeholder="Atorvastatin" />
-          </label>
+              <label>
+                Generic name
+                <input
+                  value={form.generic_name || ""} onChange={e=>set("generic_name", e.target.value || null)} placeholder="Atorvastatin" />
+              </label>
 
           <label>
             Dose strength*
@@ -142,42 +144,42 @@ export default function MedicationFormModal({ open, onClose, initial, onSubmit, 
               value={form.frequency} onChange={e=>set("frequency", e.target.value)} placeholder="1 tab daily" />
           </label>
 
-          <label>
-            Dose form
-            <select value={form.dose_form} onChange={e=>set("dose_form", e.target.value)}>
-              <option value="">—</option>
-              {doseForms.map(f => <option key={f} value={f}>{f}</option>)}
-            </select>
-          </label>
-          <label>
-            Route
-            <select value={form.route} onChange={e=>set("route", e.target.value)}>
-              <option value="">—</option>
-              {routes.map(r => <option key={r} value={r}>{r}</option>)}
-            </select>
-          </label>
+              <label>
+                Dose form
+                <select value={form.dose_form || ""} onChange={e=>set("dose_form", e.target.value || null)}>
+                  <option value="">—</option>
+                  {doseForms.map(f => <option key={f} value={f}>{f}</option>)}
+                </select>
+              </label>
+              <label>
+                Route
+                <select value={form.route || ""} onChange={e=>set("route", e.target.value || null)}>
+                  <option value="">—</option>
+                  {routes.map(r => <option key={r} value={r}>{r}</option>)}
+                </select>
+              </label>
 
           <label className="full-width">
             Directions
             <textarea rows={2}
-              value={form.directions} onChange={e=>set("directions", e.target.value)} placeholder="Take with food in the morning" />
+              value={form.directions || ""} onChange={e=>set("directions", e.target.value || null)} placeholder="Take with food in the morning" />
           </label>
 
           <label>
             Indication
             <input
-              value={form.indication} onChange={e=>set("indication", e.target.value)} placeholder="Hyperlipidemia" />
+              value={form.indication || ""} onChange={e=>set("indication", e.target.value || null)} placeholder="Hyperlipidemia" />
           </label>
 
           <label>
             Start date
             <input type="date"
-              value={form.start_date ?? ""} onChange={e=>set("start_date", e.target.value)} />
+              value={form.start_date || ""} onChange={e=>set("start_date", e.target.value || null)} />
           </label>
           <label>
             End date
             <input type="date"
-              value={form.end_date ?? ""} onChange={e=>set("end_date", e.target.value)} />
+              value={form.end_date || ""} onChange={e=>set("end_date", e.target.value || null)} />
           </label>
 
           <label className="full-width">
@@ -192,23 +194,23 @@ export default function MedicationFormModal({ open, onClose, initial, onSubmit, 
           <label>
             Prescriber
             <input
-              value={form.prescribing_provider} onChange={e=>set("prescribing_provider", e.target.value)} placeholder="Dr. Smith" />
+              value={form.prescribing_provider || ""} onChange={e=>set("prescribing_provider", e.target.value || null)} placeholder="Dr. Smith" />
           </label>
           <label>
             Pharmacy
             <input
-              value={form.pharmacy} onChange={e=>set("pharmacy", e.target.value)} placeholder="Walgreens #1234" />
+              value={form.pharmacy || ""} onChange={e=>set("pharmacy", e.target.value || null)} placeholder="Walgreens #1234" />
           </label>
 
           <label>
             NDC code
             <input
-              value={form.ndc_code} onChange={e=>set("ndc_code", e.target.value)} placeholder="00071-0155-23" />
+              value={form.ndc_code || ""} onChange={e=>set("ndc_code", e.target.value || null)} placeholder="00071-0155-23" />
           </label>
           <label>
             Last filled
             <input type="date"
-              value={form.last_filled_date ?? ""} onChange={e=>set("last_filled_date", e.target.value)} />
+              value={form.last_filled_date || ""} onChange={e=>set("last_filled_date", e.target.value || null)} />
           </label>
 
           <label>
@@ -225,7 +227,7 @@ export default function MedicationFormModal({ open, onClose, initial, onSubmit, 
           <label className="full-width">
             Notes
             <textarea rows={2}
-              value={form.notes} onChange={e=>set("notes", e.target.value)} placeholder="Any special notes..." />
+              value={form.notes || ""} onChange={e=>set("notes", e.target.value || null)} placeholder="Any special notes..." />
           </label>
 
           <div className="modal-actions">

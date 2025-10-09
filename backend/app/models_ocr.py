@@ -16,10 +16,11 @@ class DocumentPage(Base):
 
 
 # OCR-specific Document model (separate from app.models.Document)
-class Document(Base):
+class OCRDocument(Base):
     __tablename__ = "ocr_documents"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(128), nullable=True)  # Firebase UID for user isolation
     filename: Mapped[str] = mapped_column(String(512))
     mime_type: Mapped[str] = mapped_column(String(128))
     storage_path: Mapped[str] = mapped_column(String(1024))

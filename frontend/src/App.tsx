@@ -14,6 +14,8 @@ import Game from './pages/Game'
 import Sudoku from './pages/Sudoku'
 import TicTacToe from './pages/TicTacToe'
 import Memory from './pages/Memory'
+import BreathingExercise from './pages/BreathingExercise'
+import GuidedMeditation from './pages/GuidedMeditation'
 import ProtectedRoute from './routes/ProtectedRoute'
 
 export default function App() {
@@ -115,6 +117,22 @@ export default function App() {
             element={
               <ProtectedRoute>
                 <Memory />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/game/breathing"
+            element={
+              <ProtectedRoute>
+                <BreathingExercise />
+              </ProtectedRoute>
+            }
+          />
+          <Route
+            path="/game/meditation"
+            element={
+              <ProtectedRoute>
+                <GuidedMeditation />
               </ProtectedRoute>
             }
           />

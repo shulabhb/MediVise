@@ -2,7 +2,8 @@ import os, uuid, mimetypes
 from fastapi import APIRouter, UploadFile, File, HTTPException, Query, Depends
 from sqlalchemy.orm import Session
 from .database import SessionLocal
-from .models_ocr import DocumentPage, Document
+from .auth import get_current_user
+from .models_ocr import DocumentPage, OCRDocument
 from .ocr_service import ocr_pages_from_bytes, ALLOWED_MIME
 from .models import Base
 from sqlalchemy import Column, Integer, String, Text
@@ -26,7 +27,8 @@ def get_db():
 
 
 @router.post("/ingest")
-def ingest_ocr(file: UploadFile = File(...), lang: str = Query("eng"), db: Session = Depends(get_db)):
+def ingest_ocr(file: UploadFile = File(...), lang: str = Query("eng"), current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    user_id = current_user.get("uid")
     mime_type = file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream"
     fn_lower = (file.filename or "").lower()
     if mime_type not in ALLOWED_MIME and not fn_lower.endswith((".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff")):
@@ -46,7 +48,8 @@ def ingest_ocr(file: UploadFile = File(...), lang: str = Query("eng"), db: Sessi
         pages, full_text, processing_ms = ocr_pages_from_bytes(data, mime_type, lang=lang)
     except Exception as e:
         # Persist failed document record for audit/debugging
-        doc = Document(
+        doc = OCRDocument(
+            user_id=user_id,  # Add user isolation
             filename=file.filename or f"upload{ext}",
             mime_type=mime_type,
             storage_path=local_path,
@@ -62,7 +65,8 @@ def ingest_ocr(file: UploadFile = File(...), lang: str = Query("eng"), db: Sessi
         # Return a proper error response so frontend can surface it
         raise HTTPException(status_code=500, detail=f"OCR failed: {str(e)}")
 
-    doc = Document(
+    doc = OCRDocument(
+        user_id=user_id,  # Add user isolation
         filename=file.filename or f"upload{ext}",
         mime_type=mime_type,
         storage_path=local_path,

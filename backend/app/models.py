@@ -18,24 +18,20 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    # Relationships
-    conversations = relationship("Conversation", back_populates="user")
+    # Relationships - removed since we use Firebase UID directly
 
 class Conversation(Base):
     __tablename__ = "conversations"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(128), nullable=True)  # Firebase UID for user isolation
     title = Column(String)
     last_message = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     starred = Column(Boolean, default=False)
 
-    # Foreign Keys
-    user_id = Column(Integer, ForeignKey("users.id"))
-
     # Relationships
-    user = relationship("User", back_populates="conversations")
     messages = relationship("Message", back_populates="conversation")
 
 class Message(Base):
@@ -57,6 +53,7 @@ class Document(Base):
     __tablename__ = "documents"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String(128), nullable=True)  # Firebase UID for user isolation
     filename = Column(String)
     original_name = Column(String)
     file_path = Column(String)
@@ -67,9 +64,7 @@ class Document(Base):
     uploaded_at = Column(DateTime, default=datetime.utcnow)
 
     # Foreign Keys
-    user_id = Column(Integer, ForeignKey("users.id"))
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=True)
 
     # Relationships
-    user = relationship("User")
     conversation = relationship("Conversation")
