@@ -209,10 +209,21 @@ export default function Profile() {
 
   async function deleteAccount() {
     if (!confirm('Are you sure you want to permanently delete your account? This cannot be undone.')) return;
+    
+    // Prompt for password for re-authentication
+    const password = prompt('Please enter your password to confirm account deletion:');
+    if (!password) return;
+    
     setLoading(true);
     try {
       const token = await user?.getIdToken();
       if (!token) throw new Error('Not authenticated');
+      
+      // Re-authenticate user before deletion (required by Firebase)
+      if (user?.email) {
+        const credential = EmailAuthProvider.credential(user.email, password);
+        await reauthenticateWithCredential(user, credential);
+      }
       
       // Delete backend profile
       const res = await fetch('http://127.0.0.1:8000/users/me', {
@@ -232,7 +243,13 @@ export default function Profile() {
       // Redirect to home page
       window.location.href = '/';
     } catch (err: any) {
-      setError(err?.message || 'Failed to delete account');
+      if (err.code === 'auth/wrong-password') {
+        setError('Incorrect password. Please try again.');
+      } else if (err.code === 'auth/too-many-requests') {
+        setError('Too many failed attempts. Please try again later.');
+      } else {
+        setError(err?.message || 'Failed to delete account');
+      }
       console.error('Delete account error:', err);
     } finally {
       setLoading(false);

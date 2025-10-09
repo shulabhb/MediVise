@@ -13,6 +13,9 @@ from app.auth import get_current_user
 from app.database import get_db, create_tables, engine
 from sqlalchemy import text
 from app.models import User, Conversation, Message as MessageModel, Document as DocumentModel
+from app.models_medication import Medication
+from app.models_appointment import Appointment
+from app.models_ocr import OCRDocument
 
 app = FastAPI(title="MediVise API", version="0.1.0")
 
@@ -298,6 +301,40 @@ def get_document_file(doc_id: str, current_user: dict = Depends(get_current_user
         raise HTTPException(status_code=404, detail="Document not found")
     return FileResponse(d.file_path, media_type=d.document_type, filename=d.filename)
 
+@app.patch("/documents/{doc_id}")
+def update_document(doc_id: str, update_data: dict, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    uid = current_user.get("uid")
+    d = db.query(DocumentModel).filter(DocumentModel.id == doc_id, DocumentModel.user_id == uid).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    if "filename" in update_data:
+        d.filename = update_data["filename"]
+        db.commit()
+        db.refresh(d)
+    
+    return _doc_to_json(d)
+
+@app.delete("/documents/{doc_id}")
+def delete_document(doc_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    uid = current_user.get("uid")
+    d = db.query(DocumentModel).filter(DocumentModel.id == doc_id, DocumentModel.user_id == uid).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Delete the file from disk
+    try:
+        if os.path.exists(d.file_path):
+            os.remove(d.file_path)
+    except Exception as e:
+        print(f"Warning: Could not delete file {d.file_path}: {e}")
+    
+    # Delete from database
+    db.delete(d)
+    db.commit()
+    
+    return {"message": "Document deleted successfully"}
+
 # User profile endpoints expected by frontend
 @app.get("/users/me")
 def get_user_profile(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -359,6 +396,51 @@ def create_or_update_user(payload: CreateUserPayload, current_user: dict = Depen
             "last_name": user.last_name or "",
         }
     }
+
+@app.delete("/users/me")
+def delete_user_profile(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    uid = current_user.get("uid")
+    user = db.query(User).filter(User.firebase_uid == uid).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User profile not found")
+    
+    # Delete all user data (conversations, messages, documents, medications, appointments)
+    # This ensures complete data cleanup when account is deleted
+    
+    # Delete conversations and their messages
+    conversations = db.query(Conversation).filter(Conversation.user_id == uid).all()
+    for conv in conversations:
+        # Delete messages in this conversation
+        db.query(MessageModel).filter(MessageModel.conversation_id == conv.id).delete()
+        # Delete the conversation
+        db.delete(conv)
+    
+    # Delete documents
+    documents = db.query(DocumentModel).filter(DocumentModel.user_id == uid).all()
+    for doc in documents:
+        # Delete the file from disk
+        try:
+            if os.path.exists(doc.file_path):
+                os.remove(doc.file_path)
+        except Exception as e:
+            print(f"Warning: Could not delete file {doc.file_path}: {e}")
+        # Delete the document record
+        db.delete(doc)
+    
+    # Delete medications
+    db.query(Medication).filter(Medication.user_id == uid).delete()
+    
+    # Delete appointments
+    db.query(Appointment).filter(Appointment.user_id == uid).delete()
+    
+    # Delete OCR documents
+    db.query(OCRDocument).filter(OCRDocument.user_id == uid).delete()
+    
+    # Finally, delete the user profile
+    db.delete(user)
+    db.commit()
+    
+    return {"message": "User account and all associated data deleted successfully"}
 
 @app.get("/public/check-username/{username}")
 def check_username(username: str, db: Session = Depends(get_db)):

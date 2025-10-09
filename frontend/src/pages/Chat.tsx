@@ -4,6 +4,33 @@ import { useAuth } from '../context/AuthContext';
 import LoggedInNavbar from '../components/LoggedInNavbar';
 import logo2 from '../assets/MediVise2.png';
 
+// Idempotency helpers to prevent duplicate conversation creation in React StrictMode
+function beginOnce(key: string, ttlMs = 8000): boolean {
+  // returns true if we just acquired the lock; false if already locked recently
+  const now = Date.now();
+  try {
+    const raw = sessionStorage.getItem(key);
+    if (raw) {
+      const { t } = JSON.parse(raw);
+      if (now - t < ttlMs) return false; // already in progress recently
+    }
+    sessionStorage.setItem(key, JSON.stringify({ t: now }));
+    return true;
+  } catch {
+    // if sessionStorage unavailable, fallback to allow
+    return true;
+  }
+}
+
+function endOnce(key: string) {
+  try { sessionStorage.removeItem(key); } catch {}
+}
+
+// simple uuid-ish for idempotency header
+function makeNonce() {
+  return (crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`);
+}
+
 function toDate(value: any): Date {
   return value instanceof Date ? value : new Date(value);
 }
@@ -36,25 +63,29 @@ export default function Chat() {
   const [activeTab, setActiveTab] = useState<'all' | 'starred'>('all');
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
+  const [isLoading] = useState(false);
   const [showDocumentUpload, setShowDocumentUpload] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [isCreatingNew, setIsCreatingNew] = useState(false);
+  const [, setHasProcessedUrl] = useState(false);
   const location = useLocation();
 
   const BASE_URL = 'http://127.0.0.1:8000';
 
-  async function fetchWithAuth(path: string, init?: RequestInit) {
+  async function fetchWithAuth(path: string, init?: RequestInit & { idempotencyKey?: string }) {
     const token = await user?.getIdToken();
     const headers: Record<string, string> = {
       ...(init?.headers as Record<string, string> | undefined),
       'Authorization': token ? `Bearer ${token}` : '',
-    } as Record<string, string>;
-    // only set content-type if body is JSON
-    if (init?.body && !(init.headers as any)?.['Content-Type']) {
+    };
+    if (init?.body && !(init?.headers as any)?.['Content-Type']) {
       headers['Content-Type'] = 'application/json';
+    }
+    if (init?.idempotencyKey) {
+      headers['Idempotency-Key'] = init.idempotencyKey;
     }
     const res = await fetch(`${BASE_URL}${path}`, { ...init, headers });
     if (!res.ok) throw new Error(`API ${path} failed: ${res.status}`);
@@ -64,7 +95,7 @@ export default function Chat() {
   // Initialize from backend and migrate localStorage if needed
   useEffect(() => {
     async function init() {
-      if (!user) return;
+      if (!user || isCreatingNew) return;
       try {
         let convs: any[] = await fetchWithAuth('/chat/conversations');
         const hasServer = Array.isArray(convs) && convs.length > 0;
@@ -93,7 +124,14 @@ export default function Chat() {
           }
           convs = await fetchWithAuth('/chat/conversations');
         }
-        setConversations(convs as any);
+        // Deduplicate conversations by ID
+        const uniqueConvs = (convs as any).reduce((acc: any[], conv: any) => {
+          if (!acc.find(c => c.id === conv.id)) {
+            acc.push(conv);
+          }
+          return acc;
+        }, []);
+        setConversations(uniqueConvs);
         const currentId = sessionStorage.getItem('current_chat_id');
         if (currentId && (convs as any).find((c: any) => c.id === currentId)) {
           setSelectedConversation(currentId);
@@ -101,26 +139,46 @@ export default function Chat() {
           setSelectedConversation((convs as any)[0].id);
           sessionStorage.setItem('current_chat_id', (convs as any)[0].id);
         } else {
-          await createNewConversation();
+          // Only create new conversation if not already creating one via URL params
+          const params = new URLSearchParams(location.search);
+          const createNew = params.get('new') === '1';
+          if (!createNew) {
+            await createNewConversation();
+          }
         }
       } catch (e) {
         console.error('Failed to initialize conversations:', e);
       }
     }
     init();
-  }, [user]);
+  }, [user, isCreatingNew]);
 
   // If navigated with ?new=1, create a fresh conversation and attach a document if provided
   useEffect(() => {
     const params = new URLSearchParams(location.search);
     const createNew = params.get('new') === '1';
     const docId = params.get('docId');
-    if (createNew) {
-      (async () => {
+
+    if (!createNew || isCreatingNew) return;
+
+    // EARLY: remove params so StrictMode second mount won't see ?new=1
+    const url = new URL(window.location.href);
+    url.searchParams.delete('new');
+    if (docId) url.searchParams.delete('docId');
+    window.history.replaceState({}, '', url.toString());
+
+    // lock
+    const LOCK = 'creating_new_chat_lock';
+    if (!beginOnce(LOCK)) return;
+
+    setHasProcessedUrl(true);
+    setIsCreatingNew(true);
+
+    (async () => {
+      try {
         await createNewConversation();
         if (docId) {
           try {
-            // Fetch document metadata so we can attach proper info
             const doc = await fetchWithAuth(`/documents/${docId}`);
             const docInfo = {
               id: docId,
@@ -135,14 +193,12 @@ export default function Chat() {
             setNewMessage('Ask about this document...');
           }
         }
-      })();
-      // Remove the query param from the URL without reloading
-      const url = new URL(window.location.href);
-      url.searchParams.delete('new');
-      url.searchParams.delete('docId');
-      window.history.replaceState({}, '', url.toString());
-    }
-  }, [location.search]);
+      } finally {
+        setIsCreatingNew(false);
+        endOnce(LOCK);
+      }
+    })();
+  }, [location.search, isCreatingNew]);
 
   // Close any open conversation menu when conversations change or selected changes
   useEffect(() => {
@@ -194,14 +250,31 @@ export default function Chat() {
   }, [messages, isLoading, selectedConversation]);
 
   const createNewConversation = async () => {
+    const LOCK = 'creating_new_chat_lock';
+    const nonce = makeNonce();
+
+    if (!beginOnce(LOCK)) {
+      // Someone else (second mount) is already creating a chat; just bail
+      return;
+    }
+
     try {
-      const created = await fetchWithAuth('/chat/conversations', { method: 'POST' });
-      setConversations((prev) => [created as any, ...prev]);
+      const created = await fetchWithAuth('/chat/conversations', {
+        method: 'POST',
+        idempotencyKey: nonce,
+      });
+
+      setConversations((prev) => {
+        if (prev.find(c => c.id === created.id)) return prev; // de-dupe
+        return [created as any, ...prev];
+      });
       setSelectedConversation(created.id);
       sessionStorage.setItem('current_chat_id', created.id);
       setMessages([]);
     } catch (e) {
       console.error('Failed to create conversation:', e);
+    } finally {
+      endOnce(LOCK);
     }
   };
 
@@ -373,7 +446,7 @@ export default function Chat() {
             {filteredConversations
               .map((conversation) => (
                 <div
-                  key={conversation.id}
+                  key={`conv-${conversation.id}`}
                   className={`conversation-item ${selectedConversation === conversation.id ? 'active' : ''}`}
                   onClick={() => {
                     setSelectedConversation(conversation.id);
