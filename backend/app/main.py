@@ -9,6 +9,7 @@ import uuid
 import shutil
 from datetime import datetime
 import json
+import logging
 from .auth import get_current_user
 from .database import get_db, create_tables, engine
 from sqlalchemy import text
@@ -23,6 +24,9 @@ from .retrieval import extract_snippets_by_document, extract_keywords_from_conve
 from .user_memory_service import UserMemoryService
 from .pdf_context_extractor import PDFContextExtractor
 from .models_memory import UserMemory, DocumentContext, MemoryInteraction
+
+# Initialize logger
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="MediVise API", version="0.1.0")
 
