@@ -26,6 +26,11 @@ from .models_memory import UserMemory, DocumentContext, MemoryInteraction
 
 app = FastAPI(title="MediVise API", version="0.1.0")
 
+@app.get("/health")
+def health_check():
+    """Simple health check endpoint"""
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -275,57 +280,97 @@ def get_documents(current_user: dict = Depends(get_current_user), db: Session = 
     return [ _doc_to_json(d) for d in docs ]
 
 @app.post("/documents/upload")
-async def upload_document(file: UploadFile = File(...), current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    uid = current_user.get("uid")
-    os.makedirs("/tmp/medivise_docs", exist_ok=True)
-    doc_id = str(uuid.uuid4())
-    dest_path = f"/tmp/medivise_docs/{doc_id}_{file.filename}"
-    with open(dest_path, "wb") as out:
-        shutil.copyfileobj(file.file, out)
-    size = os.path.getsize(dest_path)
-    
-    # Extract content from PDF for context and memory building
-    content_preview = ""
-    full_content = ""
+def upload_document(file: UploadFile = File(...), current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Upload a document with basic content extraction (non-async for now)"""
     try:
-        if file.content_type == "application/pdf" or file.filename.lower().endswith('.pdf'):
-            # Use OCR service to extract text
-            from .ocr_service import ocr_pages_from_bytes
-            with open(dest_path, "rb") as f:
-                pdf_bytes = f.read()
-            ocr_result = ocr_pages_from_bytes(pdf_bytes)
-            if ocr_result and ocr_result.pages:
-                full_content = "\n".join([page.text for page in ocr_result.pages])
-                content_preview = full_content[:500] + "..." if len(full_content) > 500 else full_content
+        uid = current_user.get("uid")
+        os.makedirs("/tmp/medivise_docs", exist_ok=True)
+        doc_id = str(uuid.uuid4())
+        dest_path = f"/tmp/medivise_docs/{doc_id}_{file.filename}"
+        
+        # Save the file
+        with open(dest_path, "wb") as out:
+            shutil.copyfileobj(file.file, out)
+        size = os.path.getsize(dest_path)
+        
+        # Basic content extraction (simplified for now)
+        content_preview = ""
+        full_content = ""
+        
+        try:
+            if file.content_type == "application/pdf" or (file.filename and file.filename.lower().endswith('.pdf')):
+                # Try to extract text using OCR service
+                from .ocr_service import ocr_pages_from_bytes
+                with open(dest_path, "rb") as f:
+                    pdf_bytes = f.read()
+                
+                # Use the correct function signature - returns (results, full_text, processing_ms)
+                ocr_results, full_text, processing_ms = ocr_pages_from_bytes(pdf_bytes, file.content_type or "application/pdf")
+                
+                if full_text and len(full_text.strip()) > 0:
+                    full_content = full_text
+                    content_preview = full_content[:500] + "..." if len(full_content) > 500 else full_content
+                    logger.info(f"Successfully extracted {len(full_content)} characters from PDF in {processing_ms}ms")
+                else:
+                    content_preview = f"PDF document: {file.filename} (no text extracted)"
+                    logger.warning(f"No text extracted from PDF: {file.filename}")
+            else:
+                content_preview = f"Document: {file.filename}"
+                
+        except Exception as e:
+            logger.error(f"Failed to extract content from PDF: {e}")
+            content_preview = f"Document: {file.filename} (extraction failed)"
+        
+        # Create document record
+        doc = DocumentModel(
+            user_id=uid,
+            filename=file.filename,
+            original_name=file.filename,
+            file_path=dest_path,
+            file_size=size,
+            content_preview=content_preview,
+            full_content=full_content,
+            document_type=file.content_type or "application/pdf",
+        )
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
+        
+        # TODO: Extract context from PDF for memory building (async operation)
+        # This will be implemented as a background task later
+        
+        # Extract context from PDF for memory building (synchronous for now)
+        try:
+            if full_content and len(full_content) > 100:  # Only extract if we have substantial content
+                # Extract context using the PDF context extractor
+                context_data = context_extractor.extract_context(full_content)
+                
+                # Create document context record
+                doc_context = DocumentContext(
+                    user_id=uid,
+                    document_id=doc.id,
+                    medications=context_data['medications'],
+                    conditions=context_data['conditions'],
+                    allergies=context_data['allergies'],
+                    vital_signs=context_data['vital_signs'],
+                    lab_results=context_data['lab_results'],
+                    procedures=context_data['procedures'],
+                    providers=context_data['providers'],
+                    extraction_confidence=context_data['extraction_confidence']
+                )
+                db.add(doc_context)
+                db.commit()
+                
+                logger.info(f"Extracted context from document {doc.id}: {len(context_data['medications'])} medications, {len(context_data['conditions'])} conditions")
+        except Exception as e:
+            logger.error(f"Failed to extract context from document {doc.id}: {e}")
+            # Don't fail the upload if context extraction fails
+        
+        return {"document": _doc_to_json(doc)}
+        
     except Exception as e:
-        logger.error(f"Failed to extract content from PDF: {e}")
-    
-    doc = DocumentModel(
-        user_id=uid,
-        filename=file.filename,
-        original_name=file.filename,
-        file_path=dest_path,
-        file_size=size,
-        content_preview=content_preview,
-        full_content=full_content,
-        document_type=file.content_type or "application/pdf",
-    )
-    db.add(doc)
-    db.commit()
-    db.refresh(doc)
-    
-    # Extract context from PDF for memory building
-    try:
-        if full_content and len(full_content) > 100:  # Only extract if we have substantial content
-            await memory_service.extract_and_store_document_context(
-                db, uid, doc.id, full_content
-            )
-            logger.info(f"Extracted context from document {doc.id} for user {uid}")
-    except Exception as e:
-        logger.error(f"Failed to extract context from document {doc.id}: {e}")
-        # Don't fail the upload if context extraction fails
-    
-    return {"document": _doc_to_json(doc)}
+        logger.error(f"Error uploading document: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to upload document: {str(e)}")
 
 @app.get("/documents/{doc_id}")
 def get_document_meta(doc_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -334,6 +379,58 @@ def get_document_meta(doc_id: str, current_user: dict = Depends(get_current_user
     if not d:
         raise HTTPException(status_code=404, detail="Document not found")
     return _doc_to_json(d)
+
+@app.get("/documents/{doc_id}/text")
+def get_document_text(doc_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get the extracted text content from a document"""
+    uid = current_user.get("uid")
+    d = db.query(DocumentModel).filter(DocumentModel.id == doc_id, DocumentModel.user_id == uid).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    return {
+        "document_id": doc_id,
+        "filename": d.filename,
+        "extracted_text": d.full_content or "No text extracted",
+        "text_length": len(d.full_content) if d.full_content else 0,
+        "preview": d.content_preview or "No preview available"
+    }
+
+@app.get("/documents/{doc_id}/context")
+def get_document_context(doc_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get the extracted medical context from a document"""
+    uid = current_user.get("uid")
+    d = db.query(DocumentModel).filter(DocumentModel.id == doc_id, DocumentModel.user_id == uid).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Get the document context
+    doc_context = db.query(DocumentContext).filter(
+        DocumentContext.document_id == doc_id,
+        DocumentContext.user_id == uid
+    ).first()
+    
+    if not doc_context:
+        return {
+            "document_id": doc_id,
+            "filename": d.filename,
+            "message": "No context extracted yet",
+            "extracted_text_available": bool(d.full_content)
+        }
+    
+    return {
+        "document_id": doc_id,
+        "filename": d.filename,
+        "medications": doc_context.medications or [],
+        "conditions": doc_context.conditions or [],
+        "allergies": doc_context.allergies or [],
+        "vital_signs": doc_context.vital_signs or {},
+        "lab_results": doc_context.lab_results or {},
+        "procedures": doc_context.procedures or [],
+        "providers": doc_context.providers or [],
+        "extraction_confidence": doc_context.extraction_confidence,
+        "last_extracted": doc_context.last_extracted.isoformat() if doc_context.last_extracted else None
+    }
 
 @app.get("/documents/{doc_id}/file")
 def get_document_file(doc_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
