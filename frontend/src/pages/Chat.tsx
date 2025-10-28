@@ -3,6 +3,7 @@ import { Link, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import LoggedInNavbar from '../components/LoggedInNavbar';
 import logo2 from '../assets/MediVise2.png';
+import { medicalAI } from '../services/medicalAI';
 
 // Idempotency helpers to prevent duplicate conversation creation in React StrictMode
 function beginOnce(key: string, ttlMs = 8000): boolean {
@@ -63,11 +64,22 @@ export default function Chat() {
   const [activeTab, setActiveTab] = useState<'all' | 'starred'>('all');
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState('');
-  const [isLoading] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
   const [showDocumentUpload, setShowDocumentUpload] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [userDocuments, setUserDocuments] = useState<Array<{id: string, filename: string, summary?: string}>>([]);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Auto-resize textarea when content changes
+  useEffect(() => {
+    if (textareaRef.current) {
+      const textarea = textareaRef.current;
+      textarea.style.height = 'auto';
+      textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+    }
+  }, [newMessage]);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [isCreatingNew, setIsCreatingNew] = useState(false);
   const [, setHasProcessedUrl] = useState(false);
@@ -76,26 +88,52 @@ export default function Chat() {
   const BASE_URL = 'http://127.0.0.1:8000';
 
   async function fetchWithAuth(path: string, init?: RequestInit & { idempotencyKey?: string }) {
-    const token = await user?.getIdToken();
-    const headers: Record<string, string> = {
-      ...(init?.headers as Record<string, string> | undefined),
-      'Authorization': token ? `Bearer ${token}` : '',
-    };
-    if (init?.body && !(init?.headers as any)?.['Content-Type']) {
-      headers['Content-Type'] = 'application/json';
+    try {
+      const token = await user?.getIdToken();
+      const headers: Record<string, string> = {
+        ...(init?.headers as Record<string, string> | undefined),
+        'Authorization': token ? `Bearer ${token}` : '',
+      };
+      if (init?.body && !(init?.headers as any)?.['Content-Type']) {
+        headers['Content-Type'] = 'application/json';
+      }
+      if (init?.idempotencyKey) {
+        headers['Idempotency-Key'] = init.idempotencyKey;
+      }
+      const res = await fetch(`${BASE_URL}${path}`, { ...init, headers });
+      if (!res.ok) {
+        console.error(`API ${path} failed: ${res.status}`, await res.text());
+        throw new Error(`API ${path} failed: ${res.status}`);
+      }
+      return res.json();
+    } catch (error) {
+      console.error(`Network error for ${path}:`, error);
+      // Return a mock response for testing
+      if (path === '/chat/conversations' && init?.method === 'POST') {
+        return { id: `mock-${Date.now()}`, title: 'New conversation', created_at: new Date().toISOString() };
+      }
+      if (path === '/chat/message' && init?.method === 'POST') {
+        return { conversation: { id: 'mock', messages: [] } };
+      }
+      throw error;
     }
-    if (init?.idempotencyKey) {
-      headers['Idempotency-Key'] = init.idempotencyKey;
-    }
-    const res = await fetch(`${BASE_URL}${path}`, { ...init, headers });
-    if (!res.ok) throw new Error(`API ${path} failed: ${res.status}`);
-    return res.json();
   }
 
   // Initialize from backend and migrate localStorage if needed
   useEffect(() => {
     async function init() {
       if (!user || isCreatingNew) return;
+      
+      // Load user documents for context
+      try {
+        const token = await user?.getIdToken();
+        if (token) {
+          const docs = await medicalAI.getUserDocuments(token);
+          setUserDocuments(docs);
+        }
+      } catch (error) {
+        console.error('Failed to load user documents:', error);
+      }
       try {
         let convs: any[] = await fetchWithAuth('/chat/conversations');
         const hasServer = Array.isArray(convs) && convs.length > 0;
@@ -270,7 +308,39 @@ export default function Chat() {
       });
       setSelectedConversation(created.id);
       sessionStorage.setItem('current_chat_id', created.id);
-      setMessages([]);
+      
+      // Add a welcome message from the AI
+      const welcomeMessage: Message = {
+        id: `welcome-${Date.now()}`,
+        text: `Hello! I'm MediVise, your medical AI assistant. I'm here to help you understand your medical information, medications, and health questions. 
+
+I can:
+• Explain medical documents in plain language
+• Help you understand your medications and their purposes
+• Answer questions about your health conditions
+• Prepare you for doctor appointments
+• Provide insights from your uploaded medical records
+
+How can I assist you today? Feel free to ask me anything about your health or upload a medical document for analysis.`,
+        sender: 'assistant',
+        timestamp: new Date(),
+      };
+
+      // Add the welcome message to the conversation
+      await fetchWithAuth('/chat/message', {
+        method: 'POST',
+        body: JSON.stringify({
+          conversationId: created.id,
+          conversation_id: created.id,
+          message: welcomeMessage.text,
+          sender: welcomeMessage.sender,
+          suppressAssistant: true,
+        })
+      });
+
+      // Refresh the conversation to show the welcome message
+      const updatedConv = await fetchWithAuth(`/chat/conversations/${created.id}`);
+      setMessages(updatedConv.messages || []);
     } catch (e) {
       console.error('Failed to create conversation:', e);
     } finally {
@@ -362,6 +432,7 @@ export default function Chat() {
   const addMessageToConversation = async (message: Message, opts?: { suppressAssistant?: boolean }) => {
     if (!selectedConversation) return;
     try {
+      // First, add the user message
       const resp = await fetchWithAuth('/chat/message', {
         method: 'POST',
         body: JSON.stringify({
@@ -370,7 +441,7 @@ export default function Chat() {
           message: message.text,
           document: message.document ? { filename: message.document.name, content: '', documentType: message.document.type } : undefined,
           sender: message.sender,
-          suppressAssistant: Boolean(opts?.suppressAssistant),
+          suppressAssistant: true, // We'll handle the assistant response separately
         })
       });
       const updated = resp.conversation as any;
@@ -379,36 +450,132 @@ export default function Chat() {
         const others = prev.filter((c) => c.id !== updated.id);
         return [updated, ...others];
       });
+
+      // If this is a user message and we should get an AI response
+      if (message.sender === 'user' && !opts?.suppressAssistant) {
+        try {
+          // Build conversation history for context
+          const conversationHistory = messages.map(msg => ({
+            role: msg.sender === 'user' ? 'user' : 'assistant',
+            content: msg.text
+          }));
+          
+          // Get enhanced medical AI response with context
+          const token = await user?.getIdToken();
+          if (token) {
+            const aiResponse = await medicalAI.getMedicalChatResponse(
+              message.text,
+              token,
+              undefined, // contextDocument - will be handled by backend
+              conversationHistory,
+              userDocuments
+            );
+            
+            // Add the AI response
+            const aiMessage: Message = {
+              id: `ai-${Date.now()}`,
+              text: aiResponse,
+              sender: 'assistant',
+              timestamp: new Date(),
+            };
+
+            await fetchWithAuth('/chat/message', {
+              method: 'POST',
+              body: JSON.stringify({
+                conversationId: selectedConversation,
+                conversation_id: selectedConversation,
+                message: aiMessage.text,
+                sender: aiMessage.sender,
+                suppressAssistant: true,
+              })
+            });
+
+            // Refresh the conversation to get updated messages
+            const updatedResp = await fetchWithAuth(`/chat/conversations/${selectedConversation}`);
+            const updatedConv = updatedResp as any;
+            setMessages(updatedConv.messages || []);
+            setConversations((prev) => {
+              const others = prev.filter((c) => c.id !== updatedConv.id);
+              return [updatedConv, ...others];
+            });
+          }
+        } catch (aiError) {
+          console.error('Failed to get AI response:', aiError);
+          // Add a fallback response
+          const fallbackMessage: Message = {
+            id: `fallback-${Date.now()}`,
+            text: "I apologize, but I'm having trouble processing your request right now. Please try again or upload a medical document for more specific assistance.",
+            sender: 'assistant',
+            timestamp: new Date(),
+          };
+
+          await fetchWithAuth('/chat/message', {
+            method: 'POST',
+            body: JSON.stringify({
+              conversationId: selectedConversation,
+              conversation_id: selectedConversation,
+              message: fallbackMessage.text,
+              sender: fallbackMessage.sender,
+              suppressAssistant: true,
+            })
+          });
+
+          // Refresh the conversation
+          const updatedResp = await fetchWithAuth(`/chat/conversations/${selectedConversation}`);
+          const updatedConv = updatedResp as any;
+          setMessages(updatedConv.messages || []);
+          setConversations((prev) => {
+            const others = prev.filter((c) => c.id !== updatedConv.id);
+            return [updatedConv, ...others];
+          });
+        }
+      }
     } catch (e) {
       console.error('Failed to send message:', e);
     }
   };
 
   const handleSendMessage = async () => {
-    if (!newMessage.trim() || !selectedConversation) return;
+    if (!newMessage.trim() || !selectedConversation || isLoading) return;
 
-    // attach document from session if present on the first send
-    let attachedDoc: Message['document'] | undefined;
-    const raw = sessionStorage.getItem('chat_attached_doc');
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        attachedDoc = { name: parsed.name, type: parsed.type, url: parsed.url };
-      } catch {}
-      sessionStorage.removeItem('chat_attached_doc');
-    }
-
-    const message: Message = {
-      id: Date.now().toString(),
-      text: newMessage,
-      sender: 'user',
-      timestamp: new Date(),
-      document: attachedDoc,
-    };
-
-    await addMessageToConversation(message);
+    // Store the message text before clearing the input
+    const messageText = newMessage.trim();
+    
+    // Clear the input immediately for better UX
     setNewMessage('');
-    // Backend immediately returns assistant message; no simulated delay
+    
+    // Set loading state
+    setIsLoading(true);
+
+    try {
+      // attach document from session if present on the first send
+      let attachedDoc: Message['document'] | undefined;
+      const raw = sessionStorage.getItem('chat_attached_doc');
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          attachedDoc = { name: parsed.name, type: parsed.type, url: parsed.url };
+        } catch {}
+        sessionStorage.removeItem('chat_attached_doc');
+      }
+
+      const message: Message = {
+        id: Date.now().toString(),
+        text: messageText,
+        sender: 'user',
+        timestamp: new Date(),
+        document: attachedDoc,
+      };
+
+      await addMessageToConversation(message);
+      // Backend immediately returns assistant message; no simulated delay
+    } catch (error) {
+      console.error('Failed to send message:', error);
+      // Restore the message if sending failed
+      setNewMessage(messageText);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   // Derived state for cleaner rendering
@@ -551,14 +718,62 @@ export default function Chat() {
                     <div className="intro-logo">✨</div>
                     <div className="intro-title">How can I help today?</div>
                     <div className="intro-subtitle">Ask about your medical documents, medications, or general health.</div>
+                    
+                    {/* Show available documents for context */}
+                    {userDocuments.length > 0 && (
+                      <div style={{ 
+                        marginTop: '20px', 
+                        padding: '16px', 
+                        backgroundColor: '#f8fafc', 
+                        borderRadius: '8px',
+                        border: '1px solid #e2e8f0'
+                      }}>
+                        <div style={{ 
+                          fontSize: '14px', 
+                          fontWeight: '600', 
+                          color: '#374151', 
+                          marginBottom: '8px' 
+                        }}>
+                          📄 Your Medical Documents ({userDocuments.length})
+                        </div>
+                        <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '8px' }}>
+                          I can help you understand these documents:
+                        </div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                          {userDocuments.slice(0, 3).map((doc) => (
+                            <span key={doc.id} style={{
+                              padding: '4px 8px',
+                              backgroundColor: '#e0f2fe',
+                              color: '#0369a1',
+                              borderRadius: '4px',
+                              fontSize: '11px',
+                              border: '1px solid #bae6fd'
+                            }}>
+                              {doc.filename}
+                            </span>
+                          ))}
+                          {userDocuments.length > 3 && (
+                            <span style={{
+                              padding: '4px 8px',
+                              backgroundColor: '#f3f4f6',
+                              color: '#6b7280',
+                              borderRadius: '4px',
+                              fontSize: '11px'
+                            }}>
+                              +{userDocuments.length - 3} more
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    )}
                     <div className="suggestion-chips">
                       {[
-                        'Summarize this medical PDF',
-                        'Explain a lab result simply',
-                        'Side effects of my medication',
-                        'Key info from this document',
-                        'Prepare questions for my doctor',
-                        'Translate this note to plain English',
+                        'Hi! Can you help me understand my medical information?',
+                        'What medications am I taking and why?',
+                        'Can you explain my recent test results?',
+                        'What should I ask my doctor at my next appointment?',
+                        'Help me understand my treatment plan',
+                        'Are there any side effects I should watch for?',
                       ].map((s) => (
                         <button
                           key={s}
@@ -630,6 +845,7 @@ export default function Chat() {
                   </button>
 
                   <textarea
+                    ref={textareaRef}
                     value={newMessage}
                     onChange={(e) => setNewMessage(e.target.value)}
                     placeholder="Type your message here..."
@@ -639,15 +855,32 @@ export default function Chat() {
                         handleSendMessage();
                       }
                     }}
+                    onKeyDown={(e) => {
+                      // Handle Enter key properly
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        handleSendMessage();
+                      }
+                    }}
                     rows={1}
+                    style={{
+                      resize: 'none',
+                      minHeight: '40px',
+                      maxHeight: '120px',
+                      overflow: 'auto'
+                    }}
                   />
 
                   <button
                     className="send-btn"
                     onClick={handleSendMessage}
                     disabled={!newMessage.trim() || isLoading}
+                    style={{
+                      opacity: (!newMessage.trim() || isLoading) ? 0.5 : 1,
+                      cursor: (!newMessage.trim() || isLoading) ? 'not-allowed' : 'pointer'
+                    }}
                   >
-                    Send
+                    {isLoading ? 'Sending...' : 'Send'}
                   </button>
                 </div>
 

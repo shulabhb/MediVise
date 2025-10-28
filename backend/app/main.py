@@ -2,20 +2,23 @@ from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict
 from sqlalchemy.orm import Session
 import os
 import uuid
 import shutil
 from datetime import datetime
 import json
-from app.auth import get_current_user
-from app.database import get_db, create_tables, engine
+from .auth import get_current_user
+from .database import get_db, create_tables, engine
 from sqlalchemy import text
-from app.models import User, Conversation, Message as MessageModel, Document as DocumentModel
-from app.models_medication import Medication
-from app.models_appointment import Appointment
-from app.models_ocr import OCRDocument
+from .models import User, Conversation, Message as MessageModel, Document as DocumentModel
+from .models_medication import Medication
+from .models_appointment import Appointment
+from .models_ocr import OCRDocument
+from .llm_service import summarize_document, answer_question, MedicalLLMService
+from .schemas_summary import SummaryRequest, SummaryResponse, ChatResponse, DocumentSnippet
+from .retrieval import extract_snippets_by_document, extract_keywords_from_conversation
 
 app = FastAPI(title="MediVise API", version="0.1.0")
 
@@ -31,7 +34,9 @@ app.add_middleware(
         "http://localhost:5176", 
         "http://127.0.0.1:5176",
         "http://localhost:5177", 
-        "http://127.0.0.1:5177"
+        "http://127.0.0.1:5177",
+        "http://localhost:5178", 
+        "http://127.0.0.1:5178"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -72,7 +77,7 @@ def startup_event():
         print(f"Database connection failed: {e}")
 
 # Include OCR router
-from app.routers_ocr import router as ocr_router
+from .routers_ocr import router as ocr_router
 app.include_router(ocr_router)
 # Remove in-memory docs; use DB for documents
 # In-memory conversations store keyed by uid → conv_id → conversation
@@ -80,8 +85,8 @@ CONVERSATIONS: dict = {}
 
 
 # Include other routers
-from app.routers.medications import router as medications_router
-from app.routers.appointments import router as appointments_router
+from .routers.medications import router as medications_router
+from .routers.appointments import router as appointments_router
 app.include_router(medications_router)
 app.include_router(appointments_router)
 
@@ -95,7 +100,7 @@ def test():
 
 # Essential routes for the frontend
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Dict
 from datetime import datetime
 
 class Message(BaseModel):
@@ -446,6 +451,392 @@ def delete_user_profile(current_user: dict = Depends(get_current_user), db: Sess
 def check_username(username: str, db: Session = Depends(get_db)):
     exists = db.query(User).filter(User.username == username).first() is not None
     return {"available": not exists}
+
+# LLM Integration Endpoints
+class DocumentSummaryRequest(BaseModel):
+    document_text: str
+
+class MedicalQuestionRequest(BaseModel):
+    document_text: str
+    question: str
+
+class ConversationalChatRequest(BaseModel):
+    user_message: str
+    context_document: Optional[str] = None
+    conversation_history: List[Dict[str, str]] = []
+    user_documents: List[Dict[str, str]] = []
+    include_insights: bool = True
+    conversational_mode: bool = True
+
+@app.post("/ai/summarize")
+async def summarize_medical_document(
+    request: DocumentSummaryRequest, 
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Summarize a medical document using AI
+    """
+    try:
+        result = await summarize_document(request.document_text)
+        return {
+            "success": True,
+            "summary": result["summary"],
+            "medications": result["medications"],
+            "highlights": result["highlights"],
+            "processed_at": result["processed_at"],
+            "model_used": result["model_used"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to summarize document: {str(e)}")
+
+@app.post("/ai/ask-question")
+async def ask_medical_question(
+    request: MedicalQuestionRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Ask a question about a medical document using AI
+    """
+    try:
+        result = await answer_question(request.document_text, request.question)
+        return {
+            "success": True,
+            "question": result["question"],
+            "answer": result["answer"],
+            "answered_at": result["answered_at"],
+            "model_used": result["model_used"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to answer question: {str(e)}")
+
+@app.post("/ai/summarize-document/{doc_id}")
+async def summarize_document_by_id(
+    doc_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Summarize a document by its ID using AI
+    """
+    uid = current_user.get("uid")
+    
+    # Get the document
+    doc = db.query(DocumentModel).filter(
+        DocumentModel.id == doc_id, 
+        DocumentModel.user_id == uid
+    ).first()
+    
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Get the document text (from OCR or direct content)
+    document_text = doc.full_content or doc.content_preview or ""
+    
+    if not document_text.strip():
+        raise HTTPException(status_code=400, detail="Document has no text content to summarize")
+    
+    try:
+        result = await summarize_document(document_text)
+        
+        # Update the document with the summary
+        doc.content_preview = result["summary"]
+        db.commit()
+        
+        return {
+            "success": True,
+            "document_id": doc_id,
+            "summary": result["summary"],
+            "medications": result["medications"],
+            "highlights": result["highlights"],
+            "processed_at": result["processed_at"],
+            "model_used": result["model_used"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to summarize document: {str(e)}")
+
+@app.post("/ai/ask-document-question/{doc_id}")
+async def ask_document_question(
+    doc_id: str,
+    question: str = Body(..., embed=True),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Ask a question about a specific document using AI
+    """
+    uid = current_user.get("uid")
+    
+    # Get the document
+    doc = db.query(DocumentModel).filter(
+        DocumentModel.id == doc_id, 
+        DocumentModel.user_id == uid
+    ).first()
+    
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Get the document text
+    document_text = doc.full_content or doc.content_preview or ""
+    
+    if not document_text.strip():
+        raise HTTPException(status_code=400, detail="Document has no text content")
+    
+    try:
+        result = await answer_question(document_text, question)
+        
+        return {
+            "success": True,
+            "document_id": doc_id,
+            "question": result["question"],
+            "answer": result["answer"],
+            "answered_at": result["answered_at"],
+            "model_used": result["model_used"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to answer question: {str(e)}")
+
+@app.post("/ai/chat")
+async def conversational_medical_chat(
+    request: ConversationalChatRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Enhanced conversational medical chat with context awareness
+    """
+    try:
+        from .llm_service import MedicalLLMService
+        
+        async with MedicalLLMService() as service:
+            # Build context from user documents and conversation history
+            context_info = ""
+            
+            # Add user documents context
+            if request.user_documents:
+                context_info += "USER'S MEDICAL DOCUMENTS:\n"
+                for doc in request.user_documents:
+                    context_info += f"- {doc.get('filename', 'Unknown')}: {doc.get('summary', 'No summary available')}\n"
+                context_info += "\n"
+            
+            # Add conversation history context
+            if request.conversation_history:
+                context_info += "RECENT CONVERSATION:\n"
+                for msg in request.conversation_history[-6:]:  # Last 6 messages for context
+                    role = msg.get('role', 'unknown')
+                    content = msg.get('content', '')
+                    context_info += f"{role.upper()}: {content}\n"
+                context_info += "\n"
+            
+            # Create enhanced system prompt for conversational mode
+            system_prompt = f"""You are MediVise, an advanced medical AI assistant with human-level conversational capabilities. You help patients understand their medical information in a warm, empathetic, and professional manner.
+
+CONTEXT INFORMATION:
+{context_info}
+
+YOUR CAPABILITIES:
+- Provide clear, empathetic explanations of medical information
+- Answer questions about medications, conditions, and treatments
+- Offer practical health insights and recommendations
+- Maintain conversation flow and remember context
+- Provide emotional support while being medically accurate
+
+CONVERSATION STYLE:
+- Be warm, supportive, and human-like
+- Use "I understand" and "That makes sense" to show empathy
+- Ask follow-up questions when appropriate
+- Provide actionable advice and next steps
+- Use simple language while maintaining medical accuracy
+
+IMPORTANT GUIDELINES:
+- Always remind users to consult healthcare providers for medical decisions
+- Never provide diagnostic advice or replace professional medical care
+- For urgent medical concerns, direct users to emergency services
+- Be honest about limitations and encourage professional consultation
+- Maintain patient privacy and confidentiality
+
+Current user message: {request.user_message}
+
+Respond as a caring, knowledgeable medical assistant who truly wants to help."""
+
+            # Get the AI response
+            response = await service._make_request(request.user_message, system_prompt)
+            
+            # Add medical insights if requested
+            insights = ""
+            if request.include_insights and request.user_documents:
+                insights = "\n\n💡 **Medical Insights:**\n"
+                insights += "- I can see you have medical documents uploaded. Would you like me to analyze any specific document?\n"
+                insights += "- I can help explain medications, conditions, or treatment plans from your records.\n"
+                insights += "- Feel free to ask me about any medical terms or instructions you don't understand.\n"
+            
+            return {
+                "success": True,
+                "response": response + insights,
+                "conversation_id": None,  # Will be handled by frontend
+                "timestamp": datetime.now().isoformat(),
+                "model_used": service.model_name,
+                "context_used": len(request.user_documents) > 0 or len(request.conversation_history) > 0
+            }
+            
+    except Exception as e:
+        logger.error(f"Error in conversational chat: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process chat request: {str(e)}")
+
+# New Enhanced AI Endpoints
+
+@app.post("/ai/summarize/document/{doc_id}", response_model=SummaryResponse)
+async def summarize_document_by_id_enhanced(
+    doc_id: str,
+    request: SummaryRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Enhanced document summarization using map-reduce pattern with citations and risk assessment.
+    """
+    uid = current_user.get("uid")
+    
+    # Get the document
+    doc = db.query(DocumentModel).filter(
+        DocumentModel.id == doc_id, 
+        DocumentModel.user_id == uid
+    ).first()
+    
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Get the document text (from OCR or direct content)
+    document_text = doc.full_content or doc.content_preview or ""
+    
+    if not document_text.strip():
+        raise HTTPException(status_code=400, detail="Document has no text content to summarize")
+    
+    try:
+        async with MedicalLLMService() as service:
+            result = await service.summarize_text_map_reduce(
+                text=document_text,
+                style=request.style,
+                doc_id=int(doc_id)
+            )
+            
+            # Update the document with the summary preview
+            if result.sections:
+                preview_text = result.sections[0].title + ": " + "; ".join(result.sections[0].bullets[:2])
+                doc.content_preview = preview_text[:500]  # Limit preview length
+                db.commit()
+            
+            return result
+            
+    except Exception as e:
+        logger.error(f"Error in enhanced document summarization: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to summarize document: {str(e)}")
+
+@app.post("/ai/chat/enhanced", response_model=ChatResponse)
+async def enhanced_conversational_chat(
+    request: ConversationalChatRequest,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Enhanced conversational chat with automatic document context injection.
+    """
+    try:
+        uid = current_user.get("uid")
+        
+        # Get user's recent documents for context
+        user_docs = db.query(DocumentModel).filter(
+            DocumentModel.user_id == uid
+        ).order_by(DocumentModel.uploaded_at.desc()).limit(5).all()
+        
+        # Convert to dict format for retrieval
+        documents = []
+        for doc in user_docs:
+            if doc.full_content:
+                documents.append({
+                    'id': str(doc.id),
+                    'filename': doc.filename,
+                    'full_content': doc.full_content
+                })
+        
+        # Extract keywords from conversation history
+        keywords = extract_keywords_from_conversation(request.conversation_history)
+        query = request.user_message + " " + " ".join(keywords)
+        
+        # Retrieve relevant snippets
+        snippets = extract_snippets_by_document(documents, query, max_snippets_per_doc=2)
+        
+        async with MedicalLLMService() as service:
+            if snippets:
+                # Use RAG with document context
+                result = await service.rag_answer(request.user_message, snippets)
+            else:
+                # Fallback to general conversation
+                system_prompt = f"""You are MediVise, an advanced medical AI assistant. Help the user with their medical questions in a warm, professional manner.
+
+CONVERSATION HISTORY:
+{chr(10).join([f"{msg.get('role', 'unknown')}: {msg.get('content', '')}" for msg in request.conversation_history[-4:]])}
+
+USER MESSAGE: {request.user_message}
+
+Provide a helpful response. If you need specific medical information, suggest they upload relevant documents."""
+                
+                answer = await service._make_request(request.user_message, system_prompt)
+                result = ChatResponse(
+                    answer=answer,
+                    citations=[],
+                    context_used=False,
+                    model_used=service.model_name,
+                    timestamp=datetime.now().isoformat()
+                )
+            
+            return result
+            
+    except Exception as e:
+        logger.error(f"Error in enhanced chat: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to process chat request: {str(e)}")
+
+@app.post("/ai/ask-document-question/{doc_id}", response_model=ChatResponse)
+async def ask_document_question_enhanced(
+    doc_id: str,
+    question: str = Body(..., embed=True),
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Enhanced document Q&A with snippet retrieval and citations.
+    """
+    uid = current_user.get("uid")
+    
+    # Get the document
+    doc = db.query(DocumentModel).filter(
+        DocumentModel.id == doc_id, 
+        DocumentModel.user_id == uid
+    ).first()
+    
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Get the document text
+    document_text = doc.full_content or doc.content_preview or ""
+    
+    if not document_text.strip():
+        raise HTTPException(status_code=400, detail="Document has no text content")
+    
+    try:
+        # Extract relevant snippets from the document
+        from .retrieval import extract_snippets
+        snippets = extract_snippets(document_text, question, max_snippets=6)
+        
+        # Add document context to citations
+        for snippet in snippets:
+            snippet.citation = f"doc:{doc_id} {snippet.citation}"
+        
+        async with MedicalLLMService() as service:
+            result = await service.rag_answer(question, snippets)
+            return result
+            
+    except Exception as e:
+        logger.error(f"Error in enhanced document Q&A: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to answer question: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

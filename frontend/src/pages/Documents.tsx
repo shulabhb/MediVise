@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import LoggedInNavbar from '../components/LoggedInNavbar';
+import { medicalAI } from '../services/medicalAI';
 
 type Doc = {
   id: string;
@@ -18,6 +19,8 @@ export default function Documents() {
   const [docs, setDocs] = useState<Doc[]>([]);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [newName, setNewName] = useState('');
+  const [summarizingId, setSummarizingId] = useState<string | null>(null);
+  const [summaries, setSummaries] = useState<Record<string, any>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
   const BASE_URL = 'http://127.0.0.1:8000';
 
@@ -210,6 +213,19 @@ export default function Documents() {
     }
   };
 
+  const handleSummarize = async (docId: string) => {
+    setSummarizingId(docId);
+    try {
+      const summary = await medicalAI.summarizeDocumentById(docId);
+      setSummaries(prev => ({ ...prev, [docId]: summary }));
+    } catch (error) {
+      console.error('Failed to summarize document:', error);
+      alert('Failed to summarize document. Please try again.');
+    } finally {
+      setSummarizingId(null);
+    }
+  };
+
   return (
     <div className="dashboard-page">
       <LoggedInNavbar />
@@ -268,6 +284,14 @@ export default function Documents() {
                         <>
                           <TooltipButton ariaLabel="View document" label="View" onClick={() => openViewer(d.id)}><EyeIcon /></TooltipButton>
                           <TooltipButton ariaLabel="Download document" label="Download" onClick={() => downloadDoc(d.id, d.filename)}><DownloadIcon /></TooltipButton>
+                          <button 
+                            className="button" 
+                            onClick={() => handleSummarize(d.id)}
+                            disabled={summarizingId === d.id}
+                            style={{ fontSize: '12px', padding: '4px 8px' }}
+                          >
+                            {summarizingId === d.id ? 'Summarizing...' : '🤖 Summarize'}
+                          </button>
                           <TooltipButton ariaLabel="Rename document" label="Rename" onClick={() => startRename(d)}><PencilIcon /></TooltipButton>
                           <TooltipButton ariaLabel="Delete document" label="Delete" onClick={() => deleteDoc(d.id, d.filename)}><TrashIcon /></TooltipButton>
                         </>
@@ -278,6 +302,71 @@ export default function Documents() {
               </div>
             )}
           </div>
+
+          {/* AI Summaries Section */}
+          {Object.keys(summaries).length > 0 && (
+            <div style={{ marginTop: '24px', borderTop: '1px solid rgba(0,0,0,0.06)', paddingTop: '16px' }}>
+              <h3 style={{ margin: '0 0 16px 0', color: '#1e293b' }}>🤖 AI Medical Summaries</h3>
+              {Object.entries(summaries).map(([docId, summary]) => {
+                const doc = docs.find(d => d.id === docId);
+                return (
+                  <div key={docId} style={{ 
+                    marginBottom: '16px', 
+                    padding: '16px', 
+                    backgroundColor: '#f8fafc', 
+                    borderRadius: '8px',
+                    border: '1px solid #e2e8f0'
+                  }}>
+                    <h4 style={{ margin: '0 0 12px 0', color: '#1e293b' }}>
+                      📄 {doc?.filename}
+                    </h4>
+                    
+                    <div style={{ marginBottom: '12px' }}>
+                      <strong style={{ color: '#374151' }}>Summary:</strong>
+                      <p style={{ margin: '8px 0', color: '#4b5563', lineHeight: '1.5' }}>
+                        {summary.summary}
+                      </p>
+                    </div>
+
+                    {summary.medications && summary.medications.length > 0 && (
+                      <div style={{ marginBottom: '12px' }}>
+                        <strong style={{ color: '#374151' }}>💊 Medications:</strong>
+                        <ul style={{ margin: '8px 0', paddingLeft: '20px' }}>
+                          {summary.medications.map((med: any, idx: number) => (
+                            <li key={idx} style={{ color: '#4b5563', marginBottom: '4px' }}>
+                              <strong>{med.name}</strong>: {med.details}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    {summary.highlights && summary.highlights.length > 0 && (
+                      <div>
+                        <strong style={{ color: '#374151' }}>⚠️ Important Highlights:</strong>
+                        <ul style={{ margin: '8px 0', paddingLeft: '20px' }}>
+                          {summary.highlights.map((highlight: string, idx: number) => (
+                            <li key={idx} style={{ color: '#dc2626', marginBottom: '4px' }}>
+                              {highlight}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    <div style={{ 
+                      marginTop: '12px', 
+                      fontSize: '12px', 
+                      color: '#6b7280',
+                      fontStyle: 'italic'
+                    }}>
+                      Generated by {summary.model_used} • {new Date(summary.processed_at).toLocaleString()}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </div>
     </div>
