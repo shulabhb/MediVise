@@ -17,7 +17,7 @@ from .models import User, Conversation, Message as MessageModel, Document as Doc
 from .models_medication import Medication
 from .models_appointment import Appointment
 from .models_ocr import OCRDocument
-from .models_memory import UserMemory, DocumentContext, MemoryInteraction
+from .models_memory import UserMemory, DocumentContext, MemoryInteraction, Base as MemoryBase
 from .llm_service import summarize_document, answer_question, MedicalLLMService
 from .schemas_summary import SummaryRequest, SummaryResponse, ChatResponse, DocumentSnippet
 from .retrieval import extract_snippets_by_document, extract_keywords_from_conversation
@@ -85,6 +85,8 @@ def startup_event():
     try:
         create_tables()
         _ensure_sqlite_columns()
+        # Also create memory tables
+        MemoryBase.metadata.create_all(bind=engine)
         print("Database tables created successfully")
     except Exception as e:
         print(f"Database connection failed: {e}")
