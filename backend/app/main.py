@@ -16,9 +16,13 @@ from .models import User, Conversation, Message as MessageModel, Document as Doc
 from .models_medication import Medication
 from .models_appointment import Appointment
 from .models_ocr import OCRDocument
+from .models_memory import UserMemory, DocumentContext, MemoryInteraction
 from .llm_service import summarize_document, answer_question, MedicalLLMService
 from .schemas_summary import SummaryRequest, SummaryResponse, ChatResponse, DocumentSnippet
 from .retrieval import extract_snippets_by_document, extract_keywords_from_conversation
+from .user_memory_service import UserMemoryService
+from .pdf_context_extractor import PDFContextExtractor
+from .models_memory import UserMemory, DocumentContext, MemoryInteraction
 
 app = FastAPI(title="MediVise API", version="0.1.0")
 
@@ -82,6 +86,10 @@ app.include_router(ocr_router)
 # Remove in-memory docs; use DB for documents
 # In-memory conversations store keyed by uid → conv_id → conversation
 CONVERSATIONS: dict = {}
+
+# Initialize services
+memory_service = UserMemoryService()
+context_extractor = PDFContextExtractor()
 
 
 # Include other routers
@@ -267,7 +275,7 @@ def get_documents(current_user: dict = Depends(get_current_user), db: Session = 
     return [ _doc_to_json(d) for d in docs ]
 
 @app.post("/documents/upload")
-def upload_document(file: UploadFile = File(...), current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+async def upload_document(file: UploadFile = File(...), current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     uid = current_user.get("uid")
     os.makedirs("/tmp/medivise_docs", exist_ok=True)
     doc_id = str(uuid.uuid4())
@@ -275,19 +283,48 @@ def upload_document(file: UploadFile = File(...), current_user: dict = Depends(g
     with open(dest_path, "wb") as out:
         shutil.copyfileobj(file.file, out)
     size = os.path.getsize(dest_path)
+    
+    # Extract content from PDF for context and memory building
+    content_preview = ""
+    full_content = ""
+    try:
+        if file.content_type == "application/pdf" or file.filename.lower().endswith('.pdf'):
+            # Use OCR service to extract text
+            from .ocr_service import ocr_pages_from_bytes
+            with open(dest_path, "rb") as f:
+                pdf_bytes = f.read()
+            ocr_result = ocr_pages_from_bytes(pdf_bytes)
+            if ocr_result and ocr_result.pages:
+                full_content = "\n".join([page.text for page in ocr_result.pages])
+                content_preview = full_content[:500] + "..." if len(full_content) > 500 else full_content
+    except Exception as e:
+        logger.error(f"Failed to extract content from PDF: {e}")
+    
     doc = DocumentModel(
         user_id=uid,
         filename=file.filename,
         original_name=file.filename,
         file_path=dest_path,
         file_size=size,
-        content_preview="",
-        full_content="",
+        content_preview=content_preview,
+        full_content=full_content,
         document_type=file.content_type or "application/pdf",
     )
     db.add(doc)
     db.commit()
     db.refresh(doc)
+    
+    # Extract context from PDF for memory building
+    try:
+        if full_content and len(full_content) > 100:  # Only extract if we have substantial content
+            await memory_service.extract_and_store_document_context(
+                db, uid, doc.id, full_content
+            )
+            logger.info(f"Extracted context from document {doc.id} for user {uid}")
+    except Exception as e:
+        logger.error(f"Failed to extract context from document {doc.id}: {e}")
+        # Don't fail the upload if context extraction fails
+    
     return {"document": _doc_to_json(doc)}
 
 @app.get("/documents/{doc_id}")
@@ -757,6 +794,11 @@ async def enhanced_conversational_chat(
                     'full_content': doc.full_content
                 })
         
+        # Get relevant user memories
+        user_memories = await memory_service.get_relevant_memories(
+            db, uid, request.user_message, limit=5
+        )
+        
         # Extract keywords from conversation history
         keywords = extract_keywords_from_conversation(request.conversation_history)
         query = request.user_message + " " + " ".join(keywords)
@@ -765,15 +807,44 @@ async def enhanced_conversational_chat(
         snippets = extract_snippets_by_document(documents, query, max_snippets_per_doc=2)
         
         async with MedicalLLMService() as service:
-            if snippets:
-                # Use RAG with document context
-                result = await service.rag_answer(request.user_message, snippets)
+            if snippets or user_memories:
+                # Use RAG with document context and user memories
+                enhanced_snippets = []
+                
+                # Add document snippets
+                for snippet in snippets:
+                    enhanced_snippets.append(snippet)
+                
+                # Add memory snippets
+                for memory in user_memories:
+                    memory_snippet = DocumentSnippet(
+                        text=f"User memory: {memory['value']}",
+                        citation=f"memory:{memory['category']}:{memory['key']}",
+                        relevance_score=memory['confidence']
+                    )
+                    enhanced_snippets.append(memory_snippet)
+                
+                result = await service.rag_answer(request.user_message, enhanced_snippets)
+                
+                # Learn from this interaction
+                await memory_service.learn_from_chat(
+                    db, uid, request.user_message, result.answer, 
+                    {'documents_used': len(documents), 'memories_used': len(user_memories)}
+                )
+                
             else:
-                # Fallback to general conversation
+                # Fallback to general conversation with user memories
+                memory_context = ""
+                if user_memories:
+                    memory_context = "\n\nUser's known information:\n"
+                    for memory in user_memories:
+                        memory_context += f"- {memory['category']}: {memory['value']}\n"
+                
                 system_prompt = f"""You are MediVise, an advanced medical AI assistant. Help the user with their medical questions in a warm, professional manner.
 
 CONVERSATION HISTORY:
 {chr(10).join([f"{msg.get('role', 'unknown')}: {msg.get('content', '')}" for msg in request.conversation_history[-4:]])}
+{memory_context}
 
 USER MESSAGE: {request.user_message}
 
@@ -783,9 +854,15 @@ Provide a helpful response. If you need specific medical information, suggest th
                 result = ChatResponse(
                     answer=answer,
                     citations=[],
-                    context_used=False,
+                    context_used=len(user_memories) > 0,
                     model_used=service.model_name,
                     timestamp=datetime.now().isoformat()
+                )
+                
+                # Learn from this interaction
+                await memory_service.learn_from_chat(
+                    db, uid, request.user_message, result.answer, 
+                    {'memories_used': len(user_memories)}
                 )
             
             return result
@@ -837,6 +914,146 @@ async def ask_document_question_enhanced(
     except Exception as e:
         logger.error(f"Error in enhanced document Q&A: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to answer question: {str(e)}")
+
+# Memory Management Endpoints
+
+@app.get("/memory/summary")
+async def get_memory_summary(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get a summary of user's memories."""
+    try:
+        uid = current_user.get("uid")
+        summary = await memory_service.get_user_memory_summary(db, uid)
+        return summary
+    except Exception as e:
+        logger.error(f"Error getting memory summary: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get memory summary: {str(e)}")
+
+@app.get("/memory/search")
+async def search_memories(
+    query: str,
+    category: Optional[str] = None,
+    limit: int = 10,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Search user's memories."""
+    try:
+        uid = current_user.get("uid")
+        memories = await memory_service.get_relevant_memories(db, uid, query, limit)
+        
+        # Filter by category if specified
+        if category:
+            memories = [m for m in memories if m['category'] == category]
+        
+        return {"memories": memories, "query": query, "count": len(memories)}
+    except Exception as e:
+        logger.error(f"Error searching memories: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to search memories: {str(e)}")
+
+@app.delete("/memory/{memory_id}")
+async def delete_memory(
+    memory_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Delete a specific memory."""
+    try:
+        uid = current_user.get("uid")
+        memory = db.query(UserMemory).filter(
+            UserMemory.id == memory_id,
+            UserMemory.user_id == uid
+        ).first()
+        
+        if not memory:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        
+        memory.is_active = False
+        db.commit()
+        
+        return {"message": "Memory deleted successfully", "memory_id": memory_id}
+    except Exception as e:
+        logger.error(f"Error deleting memory: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete memory: {str(e)}")
+
+@app.post("/memory/confirm/{memory_id}")
+async def confirm_memory(
+    memory_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Confirm a memory is accurate (increase confidence)."""
+    try:
+        uid = current_user.get("uid")
+        memory = db.query(UserMemory).filter(
+            UserMemory.id == memory_id,
+            UserMemory.user_id == uid
+        ).first()
+        
+        if not memory:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        
+        memory.confidence = min(1.0, memory.confidence + 0.2)
+        memory.last_updated = datetime.utcnow()
+        
+        # Log interaction
+        interaction = MemoryInteraction(
+            user_id=uid,
+            memory_id=memory_id,
+            interaction_type='confirmed',
+            context="User confirmed memory accuracy"
+        )
+        db.add(interaction)
+        db.commit()
+        
+        return {"message": "Memory confirmed", "memory_id": memory_id, "new_confidence": memory.confidence}
+    except Exception as e:
+        logger.error(f"Error confirming memory: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to confirm memory: {str(e)}")
+
+@app.post("/memory/deny/{memory_id}")
+async def deny_memory(
+    memory_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Deny a memory is accurate (decrease confidence or delete)."""
+    try:
+        uid = current_user.get("uid")
+        memory = db.query(UserMemory).filter(
+            UserMemory.id == memory_id,
+            UserMemory.user_id == uid
+        ).first()
+        
+        if not memory:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        
+        # If confidence is low, delete the memory; otherwise decrease confidence
+        if memory.confidence <= 0.3:
+            memory.is_active = False
+            action = "deleted"
+        else:
+            memory.confidence = max(0.0, memory.confidence - 0.3)
+            action = "confidence_decreased"
+        
+        memory.last_updated = datetime.utcnow()
+        
+        # Log interaction
+        interaction = MemoryInteraction(
+            user_id=uid,
+            memory_id=memory_id,
+            interaction_type='denied',
+            context="User denied memory accuracy"
+        )
+        db.add(interaction)
+        db.commit()
+        
+        return {"message": f"Memory {action}", "memory_id": memory_id, "new_confidence": memory.confidence}
+    except Exception as e:
+        logger.error(f"Error denying memory: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to deny memory: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
