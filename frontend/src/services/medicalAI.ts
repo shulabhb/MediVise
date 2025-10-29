@@ -34,6 +34,48 @@ class MedicalAIService {
     };
   }
 
+  /**
+   * Retry helper with exponential backoff (max 3 retries)
+   */
+  private async fetchWithRetry(
+    url: string,
+    init: RequestInit,
+    maxRetries: number = 3
+  ): Promise<Response> {
+    let lastError: Error | null = null;
+    
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      try {
+        const response = await fetch(url, init);
+        
+        // Retry on 5xx errors and network errors, but not on 4xx (client errors)
+        if (response.ok || (response.status >= 400 && response.status < 500)) {
+          return response;
+        }
+        
+        // For 5xx errors, wait and retry
+        if (response.status >= 500 && attempt < maxRetries) {
+          const delay = Math.min(1000 * Math.pow(2, attempt), 5000); // Exponential backoff, max 5s
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+        
+        return response;
+      } catch (error) {
+        lastError = error as Error;
+        
+        // Retry on network errors
+        if (attempt < maxRetries) {
+          const delay = Math.min(1000 * Math.pow(2, attempt), 5000);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+      }
+    }
+    
+    throw lastError || new Error('Request failed after retries');
+  }
+
   async summarizeDocument(documentText: string, token: string): Promise<MedicalSummary> {
     try {
       const headers = this.getAuthHeaders(token);
@@ -197,11 +239,14 @@ class MedicalAIService {
   async summarizeDocumentEnhanced(docId: string, style: 'clinical' | 'patient-friendly' = 'patient-friendly', token: string): Promise<SummaryResponse> {
     try {
       const headers = this.getAuthHeaders(token);
-      const response = await fetch(`${this.baseURL}/ai/summarize/document/${docId}`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ style }),
-      });
+      const response = await this.fetchWithRetry(
+        `${this.baseURL}/ai/summarize/document/${docId}`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ style }),
+        }
+      );
 
       if (!response.ok) {
         throw new Error(`Failed to summarize document: ${response.statusText}`);
@@ -232,11 +277,14 @@ class MedicalAIService {
         conversational_mode: true
       };
 
-      const response = await fetch(`${this.baseURL}/ai/chat/enhanced`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(payload),
-      });
+      const response = await this.fetchWithRetry(
+        `${this.baseURL}/ai/chat/enhanced`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+        }
+      );
 
       if (!response.ok) {
         throw new Error(`Failed to get enhanced chat response: ${response.statusText}`);
@@ -254,11 +302,14 @@ class MedicalAIService {
   async askDocumentQuestionEnhanced(docId: string, question: string, token: string): Promise<ChatResponse> {
     try {
       const headers = this.getAuthHeaders(token);
-      const response = await fetch(`${this.baseURL}/ai/ask-document-question/${docId}`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ question }),
-      });
+      const response = await this.fetchWithRetry(
+        `${this.baseURL}/ai/ask-document-question/${docId}`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ question }),
+        }
+      );
 
       if (!response.ok) {
         throw new Error(`Failed to answer question: ${response.statusText}`);

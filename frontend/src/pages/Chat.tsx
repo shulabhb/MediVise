@@ -46,6 +46,8 @@ interface Message {
     type: string;
     url?: string;
   };
+  citations?: string[]; // Citations from AI responses
+  contextUsed?: boolean; // Whether document context was used
 }
 
 interface Conversation {
@@ -68,6 +70,7 @@ export default function Chat() {
   const [showDocumentUpload, setShowDocumentUpload] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
   const [userDocuments, setUserDocuments] = useState<Array<{id: string, filename: string, summary?: string}>>([]);
+  const [contextInfo, setContextInfo] = useState<{docsUsed: number, snippetsUsed: number} | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -460,23 +463,35 @@ How can I assist you today? Feel free to ask me anything about your health or up
             content: msg.text
           }));
           
-          // Get enhanced medical AI response with context
+          // Get enhanced medical AI response with context and citations
           const token = await user?.getIdToken();
           if (token) {
-            const aiResponse = await medicalAI.getMedicalChatResponse(
+            const chatResponse = await medicalAI.getEnhancedMedicalChatResponse(
               message.text,
               token,
-              undefined, // contextDocument - will be handled by backend
               conversationHistory,
               userDocuments
             );
             
-            // Add the AI response
+            // Extract context info from response
+            if (chatResponse.context_used && chatResponse.citations) {
+              const uniqueDocs = new Set(chatResponse.citations.map(c => c.split(' ')[0])); // Extract doc IDs
+              setContextInfo({
+                docsUsed: uniqueDocs.size,
+                snippetsUsed: chatResponse.citations.length
+              });
+            } else {
+              setContextInfo(null);
+            }
+            
+            // Add the AI response with citations
             const aiMessage: Message = {
               id: `ai-${Date.now()}`,
-              text: aiResponse,
+              text: chatResponse.answer,
               sender: 'assistant',
-              timestamp: new Date(),
+              timestamp: new Date(chatResponse.timestamp || Date.now()),
+              citations: chatResponse.citations || [],
+              contextUsed: chatResponse.context_used || false,
             };
 
             await fetchWithAuth('/chat/message', {
@@ -810,7 +825,25 @@ How can I assist you today? Feel free to ask me anything about your health or up
                           </div>
                         </div>
                       )}
-                      <div className="message-text">{message.text}</div>
+                      <div className="message-text">
+                        {message.text}
+                        {message.citations && message.citations.length > 0 && (
+                          <div style={{ 
+                            marginTop: '8px', 
+                            paddingTop: '8px',
+                            borderTop: '1px solid rgba(0,0,0,0.1)',
+                            fontSize: '12px',
+                            color: '#6b7280'
+                          }}>
+                            <div style={{ fontWeight: '600', marginBottom: '4px' }}>Citations:</div>
+                            {message.citations.map((citation, idx) => (
+                              <div key={idx} style={{ marginBottom: '2px' }}>
+                                <sup style={{ color: '#3b82f6' }}>[{idx + 1}]</sup> {citation}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
                       <div className="message-time">
                         {toDate(message.timestamp).toLocaleTimeString()}
                       </div>
@@ -832,6 +865,25 @@ How can I assist you today? Feel free to ask me anything about your health or up
 
                 <div ref={messagesEndRef} />
               </div>
+
+              {/* Context Indicator */}
+              {contextInfo && contextInfo.docsUsed > 0 && (
+                <div style={{
+                  padding: '8px 12px',
+                  marginBottom: '8px',
+                  backgroundColor: '#eff6ff',
+                  border: '1px solid #bfdbfe',
+                  borderRadius: '8px',
+                  fontSize: '12px',
+                  color: '#1e40af',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px'
+                }}>
+                  <span>📚</span>
+                  <span>Using {contextInfo.docsUsed} {contextInfo.docsUsed === 1 ? 'doc' : 'docs'} · {contextInfo.snippetsUsed} {contextInfo.snippetsUsed === 1 ? 'snippet' : 'snippets'}</span>
+                </div>
+              )}
 
               {/* Message Input */}
               <div className="message-input-container">
