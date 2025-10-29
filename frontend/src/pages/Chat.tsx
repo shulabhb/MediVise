@@ -354,59 +354,79 @@ How can I assist you today? Feel free to ask me anything about your health or up
   const handleFileUpload = async (file: File) => {
     try {
       const token = await user?.getIdToken();
-      const form = new FormData();
-      form.append('file', file);
-      const res = await fetch(`${BASE_URL}/api/ocr/ingest?lang=eng`, {
-        method: 'POST',
-        headers: { 'Authorization': token ? `Bearer ${token}` : '' },
-        body: form,
-      });
-      if (!res.ok) {
-        let detail = '';
-        try {
-          const err = await res.json();
-          detail = err?.detail || '';
-        } catch {}
-        throw new Error(`OCR failed: ${res.status}${detail ? ' - ' + detail : ''}`);
-      }
-      const data = await res.json();
-      if (!data?.full_text) {
-        throw new Error(data?.error || 'No text extracted');
-      }
-
-      // Save to Documents service as well
+      
+      // Save to Documents service - this handles both storage and text extraction
       const docForm = new FormData();
       docForm.append('file', file);
       const docRes = await fetch(`${BASE_URL}/documents/upload`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${await user?.getIdToken()}` },
+        headers: { 'Authorization': `Bearer ${token}` },
         body: docForm,
       });
+      
       if (!docRes.ok) {
-        console.warn('Document save failed:', docRes.status);
+        let errorDetail = '';
+        try {
+          const err = await docRes.json();
+          errorDetail = err?.detail || '';
+        } catch {}
+        throw new Error(`Document upload failed: ${docRes.status}${errorDetail ? ' - ' + errorDetail : ''}`);
       }
-      const docJson = await docRes.json().catch(() => null as any);
-      const savedDoc = (docJson && (docJson as any).document) || null;
+      
+      const docJson = await docRes.json();
+      const savedDoc = (docJson && docJson.document) || null;
 
+      if (!savedDoc) {
+        throw new Error('Document upload succeeded but no document data returned');
+      }
+
+      // Refresh user documents list to include the new upload
+      if (token) {
+        const updatedDocs = await medicalAI.getUserDocuments(token);
+        setUserDocuments(updatedDocs);
+      }
+
+      // Show user-friendly confirmation message
       const userDocMsg: Message = {
         id: `${Date.now()}-u`,
-        text: `Uploaded document: ${file.name}`,
+        text: `📄 Uploaded: ${file.name}`,
         sender: 'user',
         timestamp: new Date(),
-        document: savedDoc ? { name: savedDoc.filename, type: savedDoc.documentType, url: `${BASE_URL}/documents/${savedDoc.id}/file` } : { name: file.name, type: file.type }
+        document: { 
+          name: savedDoc.filename, 
+          type: savedDoc.documentType || file.type, 
+          url: `${BASE_URL}/documents/${savedDoc.id}/file` 
+        }
       };
       await addMessageToConversation(userDocMsg, { suppressAssistant: true });
 
-      const ocrMsg: Message = {
+      // Show assistant confirmation with preview
+      const previewText = savedDoc.content_preview || (savedDoc.full_content ? (savedDoc.full_content.substring(0, 200) + '...') : '') || 'Document processed successfully.';
+      const assistantMsg: Message = {
         id: `${Date.now()}-a`,
-        text: data.full_text,
+        text: `✅ Document processed successfully!\n\n📄 ${savedDoc.filename}\n\nPreview:\n${previewText}\n\nYou can now ask me questions about this document, or use the summarize buttons in the Documents page for detailed analysis.`,
         sender: 'assistant',
         timestamp: new Date()
       };
-      await addMessageToConversation(ocrMsg, { suppressAssistant: true });
+      await addMessageToConversation(assistantMsg, { suppressAssistant: true });
     } catch (e) {
-      console.error('OCR upload failed:', e);
-      alert('Failed to process document. Please try again.');
+      console.error('Document upload failed:', e);
+      const errorMsg = e instanceof Error ? e.message : 'Failed to process document. Please try again.';
+      
+      // Show error message in chat
+      const errorMessage: Message = {
+        id: `error-${Date.now()}`,
+        text: `❌ Upload Error:\n${errorMsg}`,
+        sender: 'assistant',
+        timestamp: new Date()
+      };
+      
+      try {
+        await addMessageToConversation(errorMessage, { suppressAssistant: true });
+      } catch (chatError) {
+        console.error('Failed to add error message to chat:', chatError);
+        alert(errorMsg);
+      }
     } finally {
       setShowDocumentUpload(false);
     }

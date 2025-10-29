@@ -269,8 +269,8 @@ def patch_conversation(conv_id: str, payload: dict = Body(...), current_user: di
     conv["updated_at"] = datetime.now().isoformat()
     return conv
 
-def _doc_to_json(d: DocumentModel):
-    return {
+def _doc_to_json(d: DocumentModel, include_preview: bool = False):
+    result = {
         "id": str(d.id),
         "filename": d.filename,
         "documentType": d.document_type,
@@ -278,6 +278,11 @@ def _doc_to_json(d: DocumentModel):
         "fileSize": getattr(d, "file_size", 0),
         "user_id": d.user_id,
     }
+    if include_preview:
+        result["content_preview"] = getattr(d, "content_preview", "") or ""
+        # Only include full_content in upload response, not in list views for performance
+        result["full_content"] = getattr(d, "full_content", "") or ""
+    return result
 
 @app.get("/documents")
 def get_documents(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -372,7 +377,7 @@ def upload_document(file: UploadFile = File(...), current_user: dict = Depends(g
             logger.error(f"Failed to extract context from document {doc.id}: {e}")
             # Don't fail the upload if context extraction fails
         
-        return {"document": _doc_to_json(doc)}
+        return {"document": _doc_to_json(doc, include_preview=True)}
         
     except Exception as e:
         logger.error(f"Error uploading document: {e}")
