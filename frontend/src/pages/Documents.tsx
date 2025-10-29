@@ -2,6 +2,8 @@ import { useEffect, useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import LoggedInNavbar from '../components/LoggedInNavbar';
+import { medicalAI } from '../services/medicalAI';
+import type { SummaryResponse } from '../types/ai';
 
 type Doc = {
   id: string;
@@ -18,6 +20,8 @@ export default function Documents() {
   const [docs, setDocs] = useState<Doc[]>([]);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [newName, setNewName] = useState('');
+  const [summarizingId, setSummarizingId] = useState<{id: string, style: string} | null>(null);
+  const [summaries, setSummaries] = useState<Record<string, SummaryResponse>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
   const BASE_URL = 'http://127.0.0.1:8000';
 
@@ -210,6 +214,24 @@ export default function Documents() {
     }
   };
 
+  const handleSummarize = async (docId: string, style: 'clinical' | 'patient-friendly') => {
+    setSummarizingId({ id: docId, style });
+    try {
+      const token = await user?.getIdToken();
+      if (!token) {
+        alert('Authentication required. Please log in again.');
+        return;
+      }
+      const summary = await medicalAI.summarizeDocumentEnhanced(docId, style, token);
+      setSummaries(prev => ({ ...prev, [docId]: summary }));
+    } catch (error) {
+      console.error('Failed to summarize document:', error);
+      alert('Failed to summarize document. Please try again.');
+    } finally {
+      setSummarizingId(null);
+    }
+  };
+
   return (
     <div className="dashboard-page">
       <LoggedInNavbar />
@@ -268,6 +290,24 @@ export default function Documents() {
                         <>
                           <TooltipButton ariaLabel="View document" label="View" onClick={() => openViewer(d.id)}><EyeIcon /></TooltipButton>
                           <TooltipButton ariaLabel="Download document" label="Download" onClick={() => downloadDoc(d.id, d.filename)}><DownloadIcon /></TooltipButton>
+                          <button 
+                            className="button" 
+                            onClick={() => handleSummarize(d.id, 'clinical')}
+                            disabled={summarizingId?.id === d.id}
+                            style={{ fontSize: '12px', padding: '4px 8px' }}
+                            title="Generate clinical summary"
+                          >
+                            {summarizingId?.id === d.id && summarizingId?.style === 'clinical' ? 'Summarizing...' : '📋 Clinical'}
+                          </button>
+                          <button 
+                            className="button" 
+                            onClick={() => handleSummarize(d.id, 'patient-friendly')}
+                            disabled={summarizingId?.id === d.id}
+                            style={{ fontSize: '12px', padding: '4px 8px' }}
+                            title="Generate patient-friendly summary"
+                          >
+                            {summarizingId?.id === d.id && summarizingId?.style === 'patient-friendly' ? 'Summarizing...' : '💬 Patient-friendly'}
+                          </button>
                           <TooltipButton ariaLabel="Rename document" label="Rename" onClick={() => startRename(d)}><PencilIcon /></TooltipButton>
                           <TooltipButton ariaLabel="Delete document" label="Delete" onClick={() => deleteDoc(d.id, d.filename)}><TrashIcon /></TooltipButton>
                         </>
@@ -278,6 +318,143 @@ export default function Documents() {
               </div>
             )}
           </div>
+
+          {/* AI Summaries Section */}
+          {Object.keys(summaries).length > 0 && (
+            <div style={{ marginTop: '24px', borderTop: '1px solid rgba(0,0,0,0.06)', paddingTop: '16px' }}>
+              <h3 style={{ margin: '0 0 16px 0', color: '#1e293b' }}>🤖 AI Medical Summaries</h3>
+              {Object.entries(summaries).map(([docId, summary]) => {
+                const doc = docs.find(d => d.id === docId);
+                const styleLabel = summary.style === 'clinical' ? 'Clinical Summary' : 'Patient-Friendly Summary';
+                
+                return (
+                  <div key={docId} style={{ 
+                    marginBottom: '24px', 
+                    padding: '20px', 
+                    backgroundColor: '#ffffff', 
+                    borderRadius: '12px',
+                    border: '1px solid #e2e8f0',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.1)'
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+                      <h4 style={{ margin: 0, color: '#1e293b' }}>
+                        📄 {doc?.filename}
+                      </h4>
+                      <span style={{
+                        padding: '4px 12px',
+                        backgroundColor: summary.style === 'clinical' ? '#eff6ff' : '#f0fdf4',
+                        color: summary.style === 'clinical' ? '#1e40af' : '#166534',
+                        borderRadius: '12px',
+                        fontSize: '12px',
+                        fontWeight: '600'
+                      }}>
+                        {styleLabel}
+                      </span>
+                    </div>
+
+                    {/* Sections */}
+                    {summary.sections && summary.sections.length > 0 && (
+                      <div style={{ marginBottom: '16px' }}>
+                        {summary.sections.map((section, idx) => (
+                          <div key={idx} style={{ marginBottom: '16px' }}>
+                            <h5 style={{ 
+                              margin: '0 0 8px 0', 
+                              color: '#374151',
+                              fontSize: '16px',
+                              fontWeight: '600'
+                            }}>
+                              {section.title}
+                            </h5>
+                            <ul style={{ 
+                              margin: '8px 0', 
+                              paddingLeft: '20px',
+                              color: '#4b5563',
+                              lineHeight: '1.6'
+                            }}>
+                              {section.bullets.map((bullet, bulletIdx) => (
+                                <li key={bulletIdx} style={{ marginBottom: '6px' }}>
+                                  {bullet}
+                                  {section.citations && section.citations.length > 0 && bulletIdx < section.citations.length && (
+                                    <sup style={{ color: '#3b82f6', fontSize: '10px', marginLeft: '4px' }}>
+                                      [{section.citations[bulletIdx]?.slice(-10) || bulletIdx + 1}]
+                                    </sup>
+                                  )}
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Risk Flags */}
+                    {summary.risks && summary.risks.length > 0 && (
+                      <div style={{
+                        marginTop: '16px',
+                        padding: '12px',
+                        backgroundColor: '#fef2f2',
+                        borderRadius: '8px',
+                        border: '1px solid #fecaca'
+                      }}>
+                        <strong style={{ color: '#dc2626', display: 'block', marginBottom: '8px' }}>
+                          ⚠️ Risk Flags
+                        </strong>
+                        {summary.risks.map((risk, idx) => {
+                          const severityColor = risk.severity === 'high' ? '#dc2626' : 
+                                                risk.severity === 'medium' ? '#f59e0b' : '#6b7280';
+                          return (
+                            <div key={idx} style={{ marginBottom: '8px', padding: '8px', backgroundColor: '#ffffff', borderRadius: '6px' }}>
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
+                                <span style={{
+                                  padding: '2px 8px',
+                                  backgroundColor: severityColor,
+                                  color: 'white',
+                                  borderRadius: '4px',
+                                  fontSize: '10px',
+                                  fontWeight: '600'
+                                }}>
+                                  {risk.severity.toUpperCase()}
+                                </span>
+                                <strong style={{ color: '#374151', fontSize: '13px' }}>{risk.code}</strong>
+                              </div>
+                              <p style={{ margin: '4px 0', color: '#4b5563', fontSize: '13px' }}>{risk.rationale}</p>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* Metadata */}
+                    <div style={{ 
+                      marginTop: '16px', 
+                      paddingTop: '12px',
+                      borderTop: '1px solid #e2e8f0',
+                      fontSize: '12px', 
+                      color: '#6b7280',
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center'
+                    }}>
+                      <span>
+                        Summary Style: {summary.style}
+                      </span>
+                      {summary.redactions_applied && (
+                        <span style={{
+                          padding: '2px 6px',
+                          backgroundColor: '#fef3c7',
+                          color: '#92400e',
+                          borderRadius: '4px',
+                          fontSize: '10px'
+                        }}>
+                          🔒 PHI Redacted
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </div>
     </div>

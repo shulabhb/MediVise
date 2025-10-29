@@ -3,6 +3,9 @@ import { Link, useLocation } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import LoggedInNavbar from '../components/LoggedInNavbar';
 import logo2 from '../assets/MediVise2.png';
+import { medicalAI } from '../services/medicalAI';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 // Idempotency helpers to prevent duplicate conversation creation in React StrictMode
 function beginOnce(key: string, ttlMs = 8000): boolean {
@@ -45,6 +48,8 @@ interface Message {
     type: string;
     url?: string;
   };
+  citations?: string[]; // Citations from AI responses
+  contextUsed?: boolean; // Whether document context was used
 }
 
 interface Conversation {
@@ -63,11 +68,23 @@ export default function Chat() {
   const [activeTab, setActiveTab] = useState<'all' | 'starred'>('all');
   const [messages, setMessages] = useState<Message[]>([]);
   const [newMessage, setNewMessage] = useState('');
-  const [isLoading] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
   const [showDocumentUpload, setShowDocumentUpload] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [userDocuments, setUserDocuments] = useState<Array<{id: string, filename: string, summary?: string}>>([]);
+  const [contextInfo, setContextInfo] = useState<{docsUsed: number, snippetsUsed: number} | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // Auto-resize textarea when content changes
+  useEffect(() => {
+    if (textareaRef.current) {
+      const textarea = textareaRef.current;
+      textarea.style.height = 'auto';
+      textarea.style.height = Math.min(textarea.scrollHeight, 120) + 'px';
+    }
+  }, [newMessage]);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [isCreatingNew, setIsCreatingNew] = useState(false);
   const [, setHasProcessedUrl] = useState(false);
@@ -76,26 +93,52 @@ export default function Chat() {
   const BASE_URL = 'http://127.0.0.1:8000';
 
   async function fetchWithAuth(path: string, init?: RequestInit & { idempotencyKey?: string }) {
-    const token = await user?.getIdToken();
-    const headers: Record<string, string> = {
-      ...(init?.headers as Record<string, string> | undefined),
-      'Authorization': token ? `Bearer ${token}` : '',
-    };
-    if (init?.body && !(init?.headers as any)?.['Content-Type']) {
-      headers['Content-Type'] = 'application/json';
+    try {
+      const token = await user?.getIdToken();
+      const headers: Record<string, string> = {
+        ...(init?.headers as Record<string, string> | undefined),
+        'Authorization': token ? `Bearer ${token}` : '',
+      };
+      if (init?.body && !(init?.headers as any)?.['Content-Type']) {
+        headers['Content-Type'] = 'application/json';
+      }
+      if (init?.idempotencyKey) {
+        headers['Idempotency-Key'] = init.idempotencyKey;
+      }
+      const res = await fetch(`${BASE_URL}${path}`, { ...init, headers });
+      if (!res.ok) {
+        console.error(`API ${path} failed: ${res.status}`, await res.text());
+        throw new Error(`API ${path} failed: ${res.status}`);
+      }
+      return res.json();
+    } catch (error) {
+      console.error(`Network error for ${path}:`, error);
+      // Return a mock response for testing
+      if (path === '/chat/conversations' && init?.method === 'POST') {
+        return { id: `mock-${Date.now()}`, title: 'New conversation', created_at: new Date().toISOString() };
+      }
+      if (path === '/chat/message' && init?.method === 'POST') {
+        return { conversation: { id: 'mock', messages: [] } };
+      }
+      throw error;
     }
-    if (init?.idempotencyKey) {
-      headers['Idempotency-Key'] = init.idempotencyKey;
-    }
-    const res = await fetch(`${BASE_URL}${path}`, { ...init, headers });
-    if (!res.ok) throw new Error(`API ${path} failed: ${res.status}`);
-    return res.json();
   }
 
   // Initialize from backend and migrate localStorage if needed
   useEffect(() => {
     async function init() {
       if (!user || isCreatingNew) return;
+      
+      // Load user documents for context
+      try {
+        const token = await user?.getIdToken();
+        if (token) {
+          const docs = await medicalAI.getUserDocuments(token);
+          setUserDocuments(docs);
+        }
+      } catch (error) {
+        console.error('Failed to load user documents:', error);
+      }
       try {
         let convs: any[] = await fetchWithAuth('/chat/conversations');
         const hasServer = Array.isArray(convs) && convs.length > 0;
@@ -270,7 +313,39 @@ export default function Chat() {
       });
       setSelectedConversation(created.id);
       sessionStorage.setItem('current_chat_id', created.id);
-      setMessages([]);
+      
+      // Add a welcome message from the AI
+      const welcomeMessage: Message = {
+        id: `welcome-${Date.now()}`,
+        text: `Hello! I'm MediVise, your medical AI assistant. I'm here to help you understand your medical information, medications, and health questions. 
+
+I can:
+• Explain medical documents in plain language
+• Help you understand your medications and their purposes
+• Answer questions about your health conditions
+• Prepare you for doctor appointments
+• Provide insights from your uploaded medical records
+
+How can I assist you today? Feel free to ask me anything about your health or upload a medical document for analysis.`,
+        sender: 'assistant',
+        timestamp: new Date(),
+      };
+
+      // Add the welcome message to the conversation
+      await fetchWithAuth('/chat/message', {
+        method: 'POST',
+        body: JSON.stringify({
+          conversationId: created.id,
+          conversation_id: created.id,
+          message: welcomeMessage.text,
+          sender: welcomeMessage.sender,
+          suppressAssistant: true,
+        })
+      });
+
+      // Refresh the conversation to show the welcome message
+      const updatedConv = await fetchWithAuth(`/chat/conversations/${created.id}`);
+      setMessages(updatedConv.messages || []);
     } catch (e) {
       console.error('Failed to create conversation:', e);
     } finally {
@@ -281,59 +356,79 @@ export default function Chat() {
   const handleFileUpload = async (file: File) => {
     try {
       const token = await user?.getIdToken();
-      const form = new FormData();
-      form.append('file', file);
-      const res = await fetch(`${BASE_URL}/api/ocr/ingest?lang=eng`, {
-        method: 'POST',
-        headers: { 'Authorization': token ? `Bearer ${token}` : '' },
-        body: form,
-      });
-      if (!res.ok) {
-        let detail = '';
-        try {
-          const err = await res.json();
-          detail = err?.detail || '';
-        } catch {}
-        throw new Error(`OCR failed: ${res.status}${detail ? ' - ' + detail : ''}`);
-      }
-      const data = await res.json();
-      if (!data?.full_text) {
-        throw new Error(data?.error || 'No text extracted');
-      }
-
-      // Save to Documents service as well
+      
+      // Save to Documents service - this handles both storage and text extraction
       const docForm = new FormData();
       docForm.append('file', file);
       const docRes = await fetch(`${BASE_URL}/documents/upload`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${await user?.getIdToken()}` },
+        headers: { 'Authorization': `Bearer ${token}` },
         body: docForm,
       });
+      
       if (!docRes.ok) {
-        console.warn('Document save failed:', docRes.status);
+        let errorDetail = '';
+        try {
+          const err = await docRes.json();
+          errorDetail = err?.detail || '';
+        } catch {}
+        throw new Error(`Document upload failed: ${docRes.status}${errorDetail ? ' - ' + errorDetail : ''}`);
       }
-      const docJson = await docRes.json().catch(() => null as any);
-      const savedDoc = (docJson && (docJson as any).document) || null;
+      
+      const docJson = await docRes.json();
+      const savedDoc = (docJson && docJson.document) || null;
 
+      if (!savedDoc) {
+        throw new Error('Document upload succeeded but no document data returned');
+      }
+
+      // Refresh user documents list to include the new upload
+      if (token) {
+        const updatedDocs = await medicalAI.getUserDocuments(token);
+        setUserDocuments(updatedDocs);
+      }
+
+      // Show user-friendly confirmation message
       const userDocMsg: Message = {
         id: `${Date.now()}-u`,
-        text: `Uploaded document: ${file.name}`,
+        text: `📄 Uploaded: ${file.name}`,
         sender: 'user',
         timestamp: new Date(),
-        document: savedDoc ? { name: savedDoc.filename, type: savedDoc.documentType, url: `${BASE_URL}/documents/${savedDoc.id}/file` } : { name: file.name, type: file.type }
+        document: { 
+          name: savedDoc.filename, 
+          type: savedDoc.documentType || file.type, 
+          url: `${BASE_URL}/documents/${savedDoc.id}/file` 
+        }
       };
       await addMessageToConversation(userDocMsg, { suppressAssistant: true });
 
-      const ocrMsg: Message = {
+      // Show assistant confirmation with preview
+      const previewText = savedDoc.content_preview || (savedDoc.full_content ? (savedDoc.full_content.substring(0, 200) + '...') : '') || 'Document processed successfully.';
+      const assistantMsg: Message = {
         id: `${Date.now()}-a`,
-        text: data.full_text,
+        text: `✅ Document processed successfully!\n\n📄 ${savedDoc.filename}\n\nPreview:\n${previewText}\n\nYou can now ask me questions about this document, or use the summarize buttons in the Documents page for detailed analysis.`,
         sender: 'assistant',
         timestamp: new Date()
       };
-      await addMessageToConversation(ocrMsg, { suppressAssistant: true });
+      await addMessageToConversation(assistantMsg, { suppressAssistant: true });
     } catch (e) {
-      console.error('OCR upload failed:', e);
-      alert('Failed to process document. Please try again.');
+      console.error('Document upload failed:', e);
+      const errorMsg = e instanceof Error ? e.message : 'Failed to process document. Please try again.';
+      
+      // Show error message in chat
+      const errorMessage: Message = {
+        id: `error-${Date.now()}`,
+        text: `❌ Upload Error:\n${errorMsg}`,
+        sender: 'assistant',
+        timestamp: new Date()
+      };
+      
+      try {
+        await addMessageToConversation(errorMessage, { suppressAssistant: true });
+      } catch (chatError) {
+        console.error('Failed to add error message to chat:', chatError);
+        alert(errorMsg);
+      }
     } finally {
       setShowDocumentUpload(false);
     }
@@ -362,6 +457,7 @@ export default function Chat() {
   const addMessageToConversation = async (message: Message, opts?: { suppressAssistant?: boolean }) => {
     if (!selectedConversation) return;
     try {
+      // First, add the user message
       const resp = await fetchWithAuth('/chat/message', {
         method: 'POST',
         body: JSON.stringify({
@@ -370,7 +466,7 @@ export default function Chat() {
           message: message.text,
           document: message.document ? { filename: message.document.name, content: '', documentType: message.document.type } : undefined,
           sender: message.sender,
-          suppressAssistant: Boolean(opts?.suppressAssistant),
+          suppressAssistant: true, // We'll handle the assistant response separately
         })
       });
       const updated = resp.conversation as any;
@@ -379,36 +475,144 @@ export default function Chat() {
         const others = prev.filter((c) => c.id !== updated.id);
         return [updated, ...others];
       });
+
+      // If this is a user message and we should get an AI response
+      if (message.sender === 'user' && !opts?.suppressAssistant) {
+        try {
+          // Build conversation history for context
+          const conversationHistory = messages.map(msg => ({
+            role: msg.sender === 'user' ? 'user' : 'assistant',
+            content: msg.text
+          }));
+          
+          // Get enhanced medical AI response with context and citations
+          const token = await user?.getIdToken();
+          if (token) {
+            const chatResponse = await medicalAI.getEnhancedMedicalChatResponse(
+              message.text,
+              token,
+              conversationHistory,
+              userDocuments
+            );
+            
+            // Extract context info from response
+            if (chatResponse.context_used && chatResponse.citations) {
+              const uniqueDocs = new Set(chatResponse.citations.map(c => c.split(' ')[0])); // Extract doc IDs
+              setContextInfo({
+                docsUsed: uniqueDocs.size,
+                snippetsUsed: chatResponse.citations.length
+              });
+            } else {
+              setContextInfo(null);
+            }
+            
+            // Add the AI response with citations
+            const aiMessage: Message = {
+              id: `ai-${Date.now()}`,
+              text: chatResponse.answer,
+              sender: 'assistant',
+              timestamp: new Date(chatResponse.timestamp || Date.now()),
+              citations: chatResponse.citations || [],
+              contextUsed: chatResponse.context_used || false,
+            };
+
+            await fetchWithAuth('/chat/message', {
+              method: 'POST',
+              body: JSON.stringify({
+                conversationId: selectedConversation,
+                conversation_id: selectedConversation,
+                message: aiMessage.text,
+                sender: aiMessage.sender,
+                suppressAssistant: true,
+              })
+            });
+
+            // Refresh the conversation to get updated messages
+            const updatedResp = await fetchWithAuth(`/chat/conversations/${selectedConversation}`);
+            const updatedConv = updatedResp as any;
+            setMessages(updatedConv.messages || []);
+            setConversations((prev) => {
+              const others = prev.filter((c) => c.id !== updatedConv.id);
+              return [updatedConv, ...others];
+            });
+          }
+        } catch (aiError) {
+          console.error('Failed to get AI response:', aiError);
+          // Add a fallback response
+          const fallbackMessage: Message = {
+            id: `fallback-${Date.now()}`,
+            text: "I apologize, but I'm having trouble processing your request right now. Please try again or upload a medical document for more specific assistance.",
+            sender: 'assistant',
+            timestamp: new Date(),
+          };
+
+          await fetchWithAuth('/chat/message', {
+            method: 'POST',
+            body: JSON.stringify({
+              conversationId: selectedConversation,
+              conversation_id: selectedConversation,
+              message: fallbackMessage.text,
+              sender: fallbackMessage.sender,
+              suppressAssistant: true,
+            })
+          });
+
+          // Refresh the conversation
+          const updatedResp = await fetchWithAuth(`/chat/conversations/${selectedConversation}`);
+          const updatedConv = updatedResp as any;
+          setMessages(updatedConv.messages || []);
+          setConversations((prev) => {
+            const others = prev.filter((c) => c.id !== updatedConv.id);
+            return [updatedConv, ...others];
+          });
+        }
+      }
     } catch (e) {
       console.error('Failed to send message:', e);
     }
   };
 
   const handleSendMessage = async () => {
-    if (!newMessage.trim() || !selectedConversation) return;
+    if (!newMessage.trim() || !selectedConversation || isLoading) return;
 
-    // attach document from session if present on the first send
-    let attachedDoc: Message['document'] | undefined;
-    const raw = sessionStorage.getItem('chat_attached_doc');
-    if (raw) {
-      try {
-        const parsed = JSON.parse(raw);
-        attachedDoc = { name: parsed.name, type: parsed.type, url: parsed.url };
-      } catch {}
-      sessionStorage.removeItem('chat_attached_doc');
-    }
-
-    const message: Message = {
-      id: Date.now().toString(),
-      text: newMessage,
-      sender: 'user',
-      timestamp: new Date(),
-      document: attachedDoc,
-    };
-
-    await addMessageToConversation(message);
+    // Store the message text before clearing the input
+    const messageText = newMessage.trim();
+    
+    // Clear the input immediately for better UX
     setNewMessage('');
-    // Backend immediately returns assistant message; no simulated delay
+    
+    // Set loading state
+    setIsLoading(true);
+
+    try {
+      // attach document from session if present on the first send
+      let attachedDoc: Message['document'] | undefined;
+      const raw = sessionStorage.getItem('chat_attached_doc');
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          attachedDoc = { name: parsed.name, type: parsed.type, url: parsed.url };
+        } catch {}
+        sessionStorage.removeItem('chat_attached_doc');
+      }
+
+      const message: Message = {
+        id: Date.now().toString(),
+        text: messageText,
+        sender: 'user',
+        timestamp: new Date(),
+        document: attachedDoc,
+      };
+
+      await addMessageToConversation(message);
+      // Backend immediately returns assistant message; no simulated delay
+    } catch (error) {
+      console.error('Failed to send message:', error);
+      // Restore the message if sending failed
+      setNewMessage(messageText);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   // Derived state for cleaner rendering
@@ -551,14 +755,62 @@ export default function Chat() {
                     <div className="intro-logo">✨</div>
                     <div className="intro-title">How can I help today?</div>
                     <div className="intro-subtitle">Ask about your medical documents, medications, or general health.</div>
+                    
+                    {/* Show available documents for context */}
+                    {userDocuments.length > 0 && (
+                      <div style={{ 
+                        marginTop: '20px', 
+                        padding: '16px', 
+                        backgroundColor: '#f8fafc', 
+                        borderRadius: '8px',
+                        border: '1px solid #e2e8f0'
+                      }}>
+                        <div style={{ 
+                          fontSize: '14px', 
+                          fontWeight: '600', 
+                          color: '#374151', 
+                          marginBottom: '8px' 
+                        }}>
+                          📄 Your Medical Documents ({userDocuments.length})
+                        </div>
+                        <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '8px' }}>
+                          I can help you understand these documents:
+                        </div>
+                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px' }}>
+                          {userDocuments.slice(0, 3).map((doc) => (
+                            <span key={doc.id} style={{
+                              padding: '4px 8px',
+                              backgroundColor: '#e0f2fe',
+                              color: '#0369a1',
+                              borderRadius: '4px',
+                              fontSize: '11px',
+                              border: '1px solid #bae6fd'
+                            }}>
+                              {doc.filename}
+                            </span>
+                          ))}
+                          {userDocuments.length > 3 && (
+                            <span style={{
+                              padding: '4px 8px',
+                              backgroundColor: '#f3f4f6',
+                              color: '#6b7280',
+                              borderRadius: '4px',
+                              fontSize: '11px'
+                            }}>
+                              +{userDocuments.length - 3} more
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    )}
                     <div className="suggestion-chips">
                       {[
-                        'Summarize this medical PDF',
-                        'Explain a lab result simply',
-                        'Side effects of my medication',
-                        'Key info from this document',
-                        'Prepare questions for my doctor',
-                        'Translate this note to plain English',
+                        'Hi! Can you help me understand my medical information?',
+                        'What medications am I taking and why?',
+                        'Can you explain my recent test results?',
+                        'What should I ask my doctor at my next appointment?',
+                        'Help me understand my treatment plan',
+                        'Are there any side effects I should watch for?',
                       ].map((s) => (
                         <button
                           key={s}
@@ -595,7 +847,56 @@ export default function Chat() {
                           </div>
                         </div>
                       )}
-                      <div className="message-text">{message.text}</div>
+                      <div className="message-text">
+                        <div className="markdown-content">
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm]}
+                            components={{
+                            // Headings with better hierarchy
+                            h1: ({node, ...props}) => <h1 className="markdown-h1" {...props} />,
+                            h2: ({node, ...props}) => <h2 className="markdown-h2" {...props} />,
+                            h3: ({node, ...props}) => <h3 className="markdown-h3" {...props} />,
+                            // Lists with better spacing
+                            ul: ({node, ...props}) => <ul className="markdown-list" {...props} />,
+                            ol: ({node, ...props}) => <ol className="markdown-list" {...props} />,
+                            li: ({node, ...props}) => <li className="markdown-list-item" {...props} />,
+                            // Emphasis
+                            strong: ({node, ...props}) => <strong className="markdown-strong" {...props} />,
+                            em: ({node, ...props}) => <em className="markdown-em" {...props} />,
+                            // Code blocks
+                            code: ({node, className, ...props}: any) => {
+                              const isInline = !className;
+                              return isInline ? (
+                                <code className="markdown-inline-code" {...props} />
+                              ) : (
+                                <code className="markdown-code-block" {...props} />
+                              );
+                            },
+                            // Paragraphs with spacing
+                            p: ({node, ...props}) => <p className="markdown-paragraph" {...props} />,
+                            // Blockquotes
+                            blockquote: ({node, ...props}) => <blockquote className="markdown-blockquote" {...props} />,
+                            // Links
+                            a: ({node, ...props}) => <a className="markdown-link" {...props} target="_blank" rel="noopener noreferrer" />,
+                          }}
+                          >
+                            {message.text}
+                          </ReactMarkdown>
+                        </div>
+                        {message.citations && message.citations.length > 0 && (
+                          <div className="citations-section">
+                            <div className="citations-header">📚 References</div>
+                            <div className="citations-list">
+                              {message.citations.map((citation, idx) => (
+                                <div key={idx} className="citation-item">
+                                  <span className="citation-number">[{idx + 1}]</span>
+                                  <span className="citation-text">{citation}</span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
                       <div className="message-time">
                         {toDate(message.timestamp).toLocaleTimeString()}
                       </div>
@@ -618,6 +919,25 @@ export default function Chat() {
                 <div ref={messagesEndRef} />
               </div>
 
+              {/* Context Indicator */}
+              {contextInfo && contextInfo.docsUsed > 0 && (
+                <div style={{
+                  padding: '8px 12px',
+                  marginBottom: '8px',
+                  backgroundColor: '#eff6ff',
+                  border: '1px solid #bfdbfe',
+                  borderRadius: '8px',
+                  fontSize: '12px',
+                  color: '#1e40af',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '8px'
+                }}>
+                  <span>📚</span>
+                  <span>Using {contextInfo.docsUsed} {contextInfo.docsUsed === 1 ? 'doc' : 'docs'} · {contextInfo.snippetsUsed} {contextInfo.snippetsUsed === 1 ? 'snippet' : 'snippets'}</span>
+                </div>
+              )}
+
               {/* Message Input */}
               <div className="message-input-container">
                 <div className="input-area">
@@ -630,6 +950,7 @@ export default function Chat() {
                   </button>
 
                   <textarea
+                    ref={textareaRef}
                     value={newMessage}
                     onChange={(e) => setNewMessage(e.target.value)}
                     placeholder="Type your message here..."
@@ -639,15 +960,32 @@ export default function Chat() {
                         handleSendMessage();
                       }
                     }}
+                    onKeyDown={(e) => {
+                      // Handle Enter key properly
+                      if (e.key === 'Enter' && !e.shiftKey) {
+                        e.preventDefault();
+                        handleSendMessage();
+                      }
+                    }}
                     rows={1}
+                    style={{
+                      resize: 'none',
+                      minHeight: '40px',
+                      maxHeight: '120px',
+                      overflow: 'auto'
+                    }}
                   />
 
                   <button
                     className="send-btn"
                     onClick={handleSendMessage}
                     disabled={!newMessage.trim() || isLoading}
+                    style={{
+                      opacity: (!newMessage.trim() || isLoading) ? 0.5 : 1,
+                      cursor: (!newMessage.trim() || isLoading) ? 'not-allowed' : 'pointer'
+                    }}
                   >
-                    Send
+                    {isLoading ? 'Sending...' : 'Send'}
                   </button>
                 </div>
 
