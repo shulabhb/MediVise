@@ -4,6 +4,8 @@ import { useAuth } from '../context/AuthContext';
 import LoggedInNavbar from '../components/LoggedInNavbar';
 import logo2 from '../assets/MediVise2.png';
 import { medicalAI } from '../services/medicalAI';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 // Idempotency helpers to prevent duplicate conversation creation in React StrictMode
 function beginOnce(key: string, ttlMs = 8000): boolean {
@@ -846,21 +848,52 @@ How can I assist you today? Feel free to ask me anything about your health or up
                         </div>
                       )}
                       <div className="message-text">
-                        {message.text}
+                        <div className="markdown-content">
+                          <ReactMarkdown
+                            remarkPlugins={[remarkGfm]}
+                            components={{
+                            // Headings with better hierarchy
+                            h1: ({node, ...props}) => <h1 className="markdown-h1" {...props} />,
+                            h2: ({node, ...props}) => <h2 className="markdown-h2" {...props} />,
+                            h3: ({node, ...props}) => <h3 className="markdown-h3" {...props} />,
+                            // Lists with better spacing
+                            ul: ({node, ...props}) => <ul className="markdown-list" {...props} />,
+                            ol: ({node, ...props}) => <ol className="markdown-list" {...props} />,
+                            li: ({node, ...props}) => <li className="markdown-list-item" {...props} />,
+                            // Emphasis
+                            strong: ({node, ...props}) => <strong className="markdown-strong" {...props} />,
+                            em: ({node, ...props}) => <em className="markdown-em" {...props} />,
+                            // Code blocks
+                            code: ({node, className, ...props}: any) => {
+                              const isInline = !className;
+                              return isInline ? (
+                                <code className="markdown-inline-code" {...props} />
+                              ) : (
+                                <code className="markdown-code-block" {...props} />
+                              );
+                            },
+                            // Paragraphs with spacing
+                            p: ({node, ...props}) => <p className="markdown-paragraph" {...props} />,
+                            // Blockquotes
+                            blockquote: ({node, ...props}) => <blockquote className="markdown-blockquote" {...props} />,
+                            // Links
+                            a: ({node, ...props}) => <a className="markdown-link" {...props} target="_blank" rel="noopener noreferrer" />,
+                          }}
+                          >
+                            {message.text}
+                          </ReactMarkdown>
+                        </div>
                         {message.citations && message.citations.length > 0 && (
-                          <div style={{ 
-                            marginTop: '8px', 
-                            paddingTop: '8px',
-                            borderTop: '1px solid rgba(0,0,0,0.1)',
-                            fontSize: '12px',
-                            color: '#6b7280'
-                          }}>
-                            <div style={{ fontWeight: '600', marginBottom: '4px' }}>Citations:</div>
-                            {message.citations.map((citation, idx) => (
-                              <div key={idx} style={{ marginBottom: '2px' }}>
-                                <sup style={{ color: '#3b82f6' }}>[{idx + 1}]</sup> {citation}
-                              </div>
-                            ))}
+                          <div className="citations-section">
+                            <div className="citations-header">📚 References</div>
+                            <div className="citations-list">
+                              {message.citations.map((citation, idx) => (
+                                <div key={idx} className="citation-item">
+                                  <span className="citation-number">[{idx + 1}]</span>
+                                  <span className="citation-text">{citation}</span>
+                                </div>
+                              ))}
+                            </div>
                           </div>
                         )}
                       </div>
