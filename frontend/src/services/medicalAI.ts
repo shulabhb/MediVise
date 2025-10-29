@@ -25,7 +25,7 @@ export interface MedicalAnswer {
 }
 
 class MedicalAIService {
-  private baseURL = 'http://127.0.0.1:8000';
+  private baseURL = (import.meta as any).env?.VITE_API_BASE ?? 'http://127.0.0.1:8000';
 
   private getAuthHeaders(token: string): HeadersInit {
     return {

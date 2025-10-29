@@ -178,11 +178,12 @@ class UserMemoryService:
                     source=source
                 )
                 db.add(memory)
+                db.flush()  # ensure memory.id is available
             
             # Log interaction
             interaction = MemoryInteraction(
                 user_id=user_id,
-                memory_id=memory.id if memory.id else 0,  # Will be updated after commit
+                memory_id=memory.id if memory.id else 0,
                 interaction_type='created' if not memory.id else 'updated',
                 context=f"Document context extraction from document {source}"
             )

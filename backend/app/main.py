@@ -18,7 +18,7 @@ from .models_medication import Medication
 from .models_appointment import Appointment
 from .models_ocr import OCRDocument
 from .models_memory import UserMemory, DocumentContext, MemoryInteraction, Base as MemoryBase
-from .llm_service import summarize_document, answer_question, MedicalLLMService
+from .llm_service import summarize_document, answer_question, MedicalLLMService, should_use_memory
 from .schemas_summary import SummaryRequest, SummaryResponse, ChatResponse, DocumentSnippet
 from .retrieval import extract_snippets_by_document, extract_keywords_from_conversation
 from .user_memory_service import UserMemoryService
@@ -27,8 +27,34 @@ from .models_memory import UserMemory, DocumentContext, MemoryInteraction
 
 # Initialize logger
 logger = logging.getLogger(__name__)
+def _strip_emojis(text: str) -> str:
+    try:
+        import re
+        emoji_pattern = re.compile(
+            "[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF\U00002700-\U000027BF\U000024C2-\U0001F251]",
+            flags=re.UNICODE,
+        )
+        return emoji_pattern.sub("", text)
+    except Exception:
+        return text
 
 app = FastAPI(title="MediVise API", version="0.1.0")
+
+# Minimal request logging middleware
+@app.middleware("http")
+async def log_requests(request, call_next):
+    import time
+    start = time.time()
+    response = None
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        duration_ms = int((time.time() - start) * 1000)
+        try:
+            logger.debug(f"{request.method} {request.url.path} -> {getattr(response, 'status_code', '?')} in {duration_ms}ms")
+        except Exception:
+            pass
 
 @app.get("/health")
 def health_check():
@@ -94,9 +120,32 @@ def startup_event():
 # Include OCR router
 from .routers_ocr import router as ocr_router
 app.include_router(ocr_router)
-# Remove in-memory docs; use DB for documents
-# In-memory conversations store keyed by uid → conv_id → conversation
-CONVERSATIONS: dict = {}
+# DB-backed conversations/messages helpers
+def get_user_conversation(db: Session, user_id: str, conv_id: str) -> Conversation:
+    return db.query(Conversation).filter(Conversation.id == conv_id, Conversation.user_id == user_id).first()
+
+def create_db_conversation(db: Session, user_id: str, title: str = "New conversation") -> Conversation:
+    conv = Conversation(user_id=user_id, title=title)
+    db.add(conv)
+    db.commit()
+    db.refresh(conv)
+    return conv
+
+def add_message(db: Session, conversation: Conversation, user_id: str, *, sender: str, text: str, document: Optional[dict] = None) -> MessageModel:
+    if conversation.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    msg = MessageModel(
+        conversation_id=conversation.id,
+        sender=sender,
+        text=text,
+        document_data=document or None,
+    )
+    db.add(msg)
+    # Touch conversation updated_at
+    conversation.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(msg)
+    return msg
 
 # Initialize services
 memory_service = UserMemoryService()
@@ -116,6 +165,12 @@ def read_root():
 @app.get("/test")
 def test():
     return {"status": "OK", "message": "Backend is working"}
+
+@app.get("/ai/health")
+async def ai_health():
+    """Check connectivity to the LLM server and list available models."""
+    async with MedicalLLMService() as service:
+        return await service.health()
 
 # Essential routes for the frontend
 from pydantic import BaseModel
@@ -152,9 +207,15 @@ def send_chat_message(chat_message: ChatMessage, current_user: dict = Depends(ge
 
 # Compat endpoint expected by frontend
 @app.post("/chat/message")
-def chat_message_compat(payload: dict = Body(...), current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
+async def chat_message_compat(payload: dict = Body(...), current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     uid = current_user.get("uid")
-    conv_id = payload.get("conversation_id") or payload.get("conversationId") or str(uuid.uuid4())
+    conv_id = payload.get("conversation_id") or payload.get("conversationId")
+    if not conv_id:
+        conv = create_db_conversation(db, uid, title="Conversation")
+    else:
+        conv = get_user_conversation(db, uid, conv_id)
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
 
     raw_msg = payload.get("message")
     top_sender = payload.get("sender")
@@ -176,98 +237,238 @@ def chat_message_compat(payload: dict = Body(...), current_user: dict = Depends(
         suppress_assistant = bool(top_suppress) if top_suppress is not None else False
     document = msg.get("document") or top_doc or None
 
-    message_obj = {
-        "id": msg.get("id") or str(uuid.uuid4()),
-        "text": msg.get("text") or "",
-        "sender": sender,
-        "timestamp": msg.get("timestamp") or datetime.now().isoformat(),
-        "document": document,
-        "suppressAssistant": suppress_assistant,
-    }
+    # Persist user message
+    add_message(db, conv, uid, sender=sender, text=(msg.get("text") or ""), document=document)
 
-    # Ensure per-user conversation container exists
-    user_convs = CONVERSATIONS.setdefault(uid, {})
-    conv = user_convs.get(conv_id)
-    if not conv:
-        conv = {"id": conv_id, "title": "Conversation", "created_at": datetime.now().isoformat(), "messages": []}
-        user_convs[conv_id] = conv
+    # If user message and not suppressed, generate assistant reply and persist
+    # Additional guard: skip auto-reply for placeholder uploads or empty text
+    user_text = (msg.get("text") or "").strip()
+    is_upload_placeholder = user_text.startswith("📄 Uploaded:") or user_text.lower().startswith("uploaded:")
+    if sender == "user" and not suppress_assistant and user_text and not is_upload_placeholder:
+        try:
+            # If a document is attached, force memory/context usage
+            use_mem = should_use_memory(msg.get("text") or "") or bool(document)
+            snippets = []
+            if use_mem:
+                user_docs = db.query(DocumentModel).filter(
+                    DocumentModel.user_id == uid
+                ).order_by(DocumentModel.uploaded_at.desc()).limit(5).all()
+                documents = []
+                # If a specific document id is referenced, prioritize it
+                attached_doc = None
+                try:
+                    attached_id = None
+                    if isinstance(document, dict):
+                        attached_id = document.get("id") or document.get("doc_id")
+                    if attached_id:
+                        attached_doc = db.query(DocumentModel).filter(DocumentModel.id == attached_id, DocumentModel.user_id == uid).first()
+                except Exception:
+                    attached_doc = None
+                if attached_doc and attached_doc.full_content:
+                    documents.append({"id": str(attached_doc.id), "filename": attached_doc.filename, "full_content": attached_doc.full_content})
+                for d in user_docs:
+                    if d.full_content:
+                        # Avoid duplicate if attached doc already added
+                        if not attached_doc or str(d.id) != str(attached_doc.id):
+                            documents.append({"id": str(d.id), "filename": d.filename, "full_content": d.full_content})
+                # Conversation history (last 6)
+                hist = db.query(MessageModel).filter(MessageModel.conversation_id == conv.id).order_by(MessageModel.id.desc()).limit(6).all()
+                history_formatted = []
+                for h in reversed(hist):
+                    history_formatted.append({"role": ("assistant" if h.sender == "assistant" else "user"), "content": h.text})
+                keywords = extract_keywords_from_conversation(history_formatted)
+                query = (msg.get("text") or "") + " " + " ".join(keywords)
+                if documents:
+                    snippets = extract_snippets_by_document(documents, query, max_snippets_per_doc=2)
 
-    conv["messages"].append(message_obj)
+            # Build lightweight conversation history for context (last 6 messages)
+            hist = db.query(MessageModel).filter(MessageModel.conversation_id == conv.id).order_by(MessageModel.id.desc()).limit(6).all()
+            history_lines = []
+            for h in reversed(hist):
+                role = "Assistant" if (h.sender == "assistant") else "User"
+                if (h.text or "").strip():
+                    history_lines.append(f"{role}: {h.text.strip()}")
+            history_block = "\n".join(history_lines[-6:])
 
-    if message_obj["sender"] == "user" and not message_obj["suppressAssistant"]:
-        assistant_msg = {
-            "id": str(uuid.uuid4()),
-            "text": "Thanks, I received your message.",
-            "sender": "assistant",
-            "timestamp": datetime.now().isoformat(),
+            async with MedicalLLMService() as service:
+                # If only a document is attached and there's no user text, produce a brief summary and a follow-up question
+                if (document and not user_text):
+                    if attached_doc and attached_doc.full_content:
+                        from .retrieval import extract_snippets
+                        try:
+                            # Extract a few representative snippets from the attached doc
+                            snippets = extract_snippets(attached_doc.full_content, "brief overall summary", max_snippets=4)
+                            result = await service.rag_answer(
+                                "Give a short, patient-friendly summary and then ask if I should do more (e.g., detailed summary, extract medications, or answer a question).",
+                                snippets
+                            )
+                            reply_text = result.answer
+                        except Exception:
+                            # Fallback to a very brief prompt without snippets
+                            system_prompt = (
+                                "You are a friendly, professional medical assistant. No emojis."
+                            )
+                            reply_text = await service._make_request(
+                                f"Conversation so far:\n{history_block}\n\nTask: Provide a short overview of the uploaded medical document (no emojis). Then ask a helpful follow-up question.",
+                                system_prompt
+                            )
+                    else:
+                        system_prompt = "You are a friendly, professional medical assistant. No emojis."
+                        reply_text = await service._make_request(
+                            f"Conversation so far:\n{history_block}\n\nTask: Provide a short overview of the uploaded medical document (no emojis). Then ask a helpful follow-up question.",
+                            system_prompt
+                        )
+                elif use_mem and snippets:
+                    # Ask with short history context prefix
+                    ask = (msg.get("text") or "").strip()
+                    if history_block:
+                        ask = f"Context:\n{history_block}\n\nUser: {ask}"
+                    result = await service.rag_answer(ask, snippets)
+                    reply_text = result.answer
+                else:
+                    system_prompt = "You are a friendly, professional medical assistant. No emojis."
+                    user_prompt = (msg.get("text") or "").strip()
+                    if history_block:
+                        user_prompt = f"Conversation so far:\n{history_block}\n\nUser: {user_prompt}"
+                    reply_text = await service._make_request(user_prompt, system_prompt)
+
+            reply_text = _strip_emojis(reply_text or "").strip()
+            add_message(db, conv, uid, sender="assistant", text=reply_text)
+        except HTTPException as he:
+            # Graceful degradation: persist a friendly fallback response instead of failing 502
+            logger.error(f"AI reply failed (HTTPException): {he.detail}")
+            fallback = (
+                "I’m having trouble reaching the AI right now, but your message was saved. "
+                "Please try again in a moment."
+            )
+            try:
+                add_message(db, conv, uid, sender="assistant", text=fallback)
+            except Exception:
+                # If even persistence fails, continue returning existing messages
+                pass
+        except Exception as e:
+            # Graceful degradation for unexpected errors
+            logger.error(f"AI reply failed: {e}")
+            fallback = (
+                "Something went wrong generating a reply. I saved your message—try sending again shortly."
+            )
+            try:
+                add_message(db, conv, uid, sender="assistant", text=fallback)
+            except Exception:
+                pass
+
+    # Return updated messages
+    q = db.query(MessageModel).filter(MessageModel.conversation_id == conv.id).order_by(MessageModel.id.asc())
+    msgs = q.all()
+    def _msg_to_json(m: MessageModel):
+        return {
+            "id": m.id,
+            "text": m.text,
+            "sender": m.sender or "user",
+            "timestamp": m.created_at.isoformat() if m.created_at else datetime.now().isoformat(),
+            "document": m.document_data or None,
         }
-        conv["messages"].append(assistant_msg)
-
-    response = {
-        "conversation_id": conv_id,
-        "conversation": conv,
-        "messages": conv["messages"],
+    return {
+        "conversation_id": conv.id,
+        "conversation": {
+            "id": conv.id,
+            "title": conv.title or "Conversation",
+            "created_at": conv.created_at.isoformat() if conv.created_at else None,
+            "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
+        },
+        "messages": [_msg_to_json(m) for m in msgs],
     }
-    return response
 
 @app.get("/chat/conversations")
 def get_conversations(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Get user's conversations (in-memory per user)"""
+    """Get user's conversations (DB)."""
     uid = current_user.get("uid")
-    user_convs = CONVERSATIONS.get(uid, {})
-    # Return without heavy messages list for sidebar
+    convs = (
+        db.query(Conversation)
+        .filter(Conversation.user_id == uid)
+        .order_by(Conversation.updated_at.desc())
+        .all()
+    )
     result = []
-    for c in user_convs.values():
+    for c in convs:
         result.append({
-            "id": c["id"],
-            "title": c.get("title") or "Conversation",
-            "created_at": c.get("created_at"),
-            "updated_at": c.get("updated_at") or c.get("created_at"),
-            "messages_count": len(c.get("messages", [])),
+            "id": c.id,
+            "title": c.title or "Conversation",
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+            "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+            "timestamp": c.updated_at.isoformat() if c.updated_at else (c.created_at.isoformat() if c.created_at else None),
+            "messages_count": db.query(MessageModel).filter(MessageModel.conversation_id == c.id).count(),
         })
-    # Most recent first
-    result.sort(key=lambda x: x.get("updated_at") or x.get("created_at"), reverse=True)
     return result
 
 @app.post("/chat/conversations")
 def create_conversation(current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Create a new conversation for the current user (in-memory)."""
+    """Create a new conversation for the current user (DB)."""
     uid = current_user.get("uid")
-    conv_id = str(uuid.uuid4())
-    conv = {"id": conv_id, "title": "New conversation", "created_at": datetime.now().isoformat(), "messages": []}
-    CONVERSATIONS.setdefault(uid, {})[conv_id] = conv
-    return conv
+    conv = create_db_conversation(db, uid, title="New conversation")
+    return {"id": conv.id, "title": conv.title, "created_at": conv.created_at.isoformat() if conv.created_at else None}
 
 @app.get("/chat/conversations/{conv_id}")
-def get_conversation(conv_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Return the user's conversation with messages."""
+def get_conversation(conv_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db), limit: int = 200, before: Optional[int] = None):
+    """Return the user's conversation with messages (DB)."""
     uid = current_user.get("uid")
-    conv = CONVERSATIONS.get(uid, {}).get(conv_id)
+    conv = get_user_conversation(db, uid, conv_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    return conv
+    q = db.query(MessageModel).filter(MessageModel.conversation_id == conv.id)
+    if before is not None:
+        q = q.filter(MessageModel.id < before)
+    msgs = q.order_by(MessageModel.id.asc()).limit(limit).all()
+    def _msg_to_json(m: MessageModel):
+        return {
+            "id": m.id,
+            "text": m.text,
+            "sender": m.sender or "user",
+            "timestamp": m.created_at.isoformat() if m.created_at else datetime.now().isoformat(),
+            "document": m.document_data or None,
+        }
+    return {
+        "id": conv.id,
+        "title": conv.title or "Conversation",
+        "created_at": conv.created_at.isoformat() if conv.created_at else None,
+        "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
+        "messages": [_msg_to_json(m) for m in msgs],
+    }
 
 @app.delete("/chat/conversations/{conv_id}")
 def delete_conversation(conv_id: str, current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     uid = current_user.get("uid")
-    convs = CONVERSATIONS.get(uid, {})
-    existed = conv_id in convs
-    if existed:
-        del convs[conv_id]
+    conv = get_user_conversation(db, uid, conv_id)
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    db.query(MessageModel).filter(MessageModel.conversation_id == conv.id).delete()
+    db.delete(conv)
+    db.commit()
     return {"ok": True, "deleted_id": conv_id}
 
 @app.patch("/chat/conversations/{conv_id}")
 def patch_conversation(conv_id: str, payload: dict = Body(...), current_user: dict = Depends(get_current_user), db: Session = Depends(get_db)):
     uid = current_user.get("uid")
-    conv = CONVERSATIONS.get(uid, {}).get(conv_id)
+    conv = get_user_conversation(db, uid, conv_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
+    updated = False
     if "title" in payload and payload["title"]:
-        conv["title"] = payload["title"]
+        conv.title = payload["title"]
+        updated = True
     if "starred" in payload:
-        conv["starred"] = bool(payload["starred"])
-    conv["updated_at"] = datetime.now().isoformat()
-    return conv
+        conv.starred = bool(payload["starred"])
+        updated = True
+    if updated:
+        conv.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(conv)
+    return {
+        "id": conv.id,
+        "title": conv.title,
+        "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
+        "timestamp": conv.updated_at.isoformat() if conv.updated_at else None,
+    }
 
 def _doc_to_json(d: DocumentModel, include_preview: bool = False):
     result = {
@@ -772,7 +973,14 @@ async def conversational_medical_chat(
                 context_info += "\n"
             
             # Create enhanced system prompt for conversational mode
-            system_prompt = f"""You are MediVise, an advanced medical AI assistant with human-level conversational capabilities. You help patients understand their medical information in a warm, empathetic, and professional manner.
+            system_prompt = f"""You are a friendly AI health assistant.
+Write responses in 3–6 short sentences.
+Use a warm, conversational tone.
+Add gentle structure with line breaks or short lists when useful.
+Avoid over-formality; be approachable and empathetic.
+End with a supportive closing line (e.g., “Would you like me to explain that more?”).
+
+You are MediVise, an advanced medical AI assistant with human-level conversational capabilities. You help patients understand their medical information in a warm, empathetic, and professional manner.
 
 CONTEXT INFORMATION:
 {context_info}
@@ -887,35 +1095,42 @@ async def enhanced_conversational_chat(
     try:
         uid = current_user.get("uid")
         
-        # Get user's recent documents for context
-        user_docs = db.query(DocumentModel).filter(
-            DocumentModel.user_id == uid
-        ).order_by(DocumentModel.uploaded_at.desc()).limit(5).all()
-        
-        # Convert to dict format for retrieval
+        # Decide whether to use memory/docs for this message
+        use_mem = should_use_memory(request.user_message)
+
         documents = []
-        for doc in user_docs:
-            if doc.full_content:
-                documents.append({
-                    'id': str(doc.id),
-                    'filename': doc.filename,
-                    'full_content': doc.full_content
-                })
-        
-        # Get relevant user memories
-        user_memories = await memory_service.get_relevant_memories(
-            db, uid, request.user_message, limit=5
-        )
-        
-        # Extract keywords from conversation history
-        keywords = extract_keywords_from_conversation(request.conversation_history)
-        query = request.user_message + " " + " ".join(keywords)
-        
-        # Retrieve relevant snippets
-        snippets = extract_snippets_by_document(documents, query, max_snippets_per_doc=2)
+        user_memories = []
+        snippets = []
+
+        if use_mem:
+            # Get user's recent documents for context
+            user_docs = db.query(DocumentModel).filter(
+                DocumentModel.user_id == uid
+            ).order_by(DocumentModel.uploaded_at.desc()).limit(5).all()
+
+            # Convert to dict format for retrieval
+            for doc in user_docs:
+                if doc.full_content:
+                    documents.append({
+                        'id': str(doc.id),
+                        'filename': doc.filename,
+                        'full_content': doc.full_content
+                    })
+
+            # Get relevant user memories
+            user_memories = await memory_service.get_relevant_memories(
+                db, uid, request.user_message, limit=5
+            )
+
+            # Extract keywords from conversation history
+            keywords = extract_keywords_from_conversation(request.conversation_history)
+            query = request.user_message + " " + " ".join(keywords)
+
+            # Retrieve relevant snippets
+            snippets = extract_snippets_by_document(documents, query, max_snippets_per_doc=2)
         
         async with MedicalLLMService() as service:
-            if snippets or user_memories:
+            if use_mem and (snippets or user_memories):
                 # Use RAG with document context and user memories
                 enhanced_snippets = []
                 
@@ -933,6 +1148,11 @@ async def enhanced_conversational_chat(
                     enhanced_snippets.append(memory_snippet)
                 
                 result = await service.rag_answer(request.user_message, enhanced_snippets)
+
+                # Preface gently when referencing prior info
+                if result and result.answer:
+                    preface = "From what you’ve shared before, here’s what I can tell:"
+                    result.answer = f"{preface}\n\n{result.answer}"
                 
                 # Learn from this interaction
                 await memory_service.learn_from_chat(
@@ -942,11 +1162,8 @@ async def enhanced_conversational_chat(
                 
             else:
                 # Fallback to general conversation with user memories
+                # For generic/greeting queries, avoid calling out memories/documents explicitly
                 memory_context = ""
-                if user_memories:
-                    memory_context = "\n\nUser's known information:\n"
-                    for memory in user_memories:
-                        memory_context += f"- {memory['category']}: {memory['value']}\n"
                 
                 system_prompt = f"""You are MediVise, an advanced medical AI assistant. Help the user with their medical questions in a warm, professional manner.
 
@@ -962,7 +1179,7 @@ Provide a helpful response. If you need specific medical information, suggest th
                 result = ChatResponse(
                     answer=answer,
                     citations=[],
-                    context_used=len(user_memories) > 0,
+                    context_used=False,
                     model_used=service.model_name,
                     timestamp=datetime.now().isoformat()
                 )

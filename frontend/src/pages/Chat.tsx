@@ -73,6 +73,7 @@ export default function Chat() {
   const [isDragOver, setIsDragOver] = useState(false);
   const [userDocuments, setUserDocuments] = useState<Array<{id: string, filename: string, summary?: string}>>([]);
   const [contextInfo, setContextInfo] = useState<{docsUsed: number, snippetsUsed: number} | null>(null);
+  const [attachedDoc, setAttachedDoc] = useState<{ id: string; name: string; type: string; url: string } | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -90,7 +91,38 @@ export default function Chat() {
   const [, setHasProcessedUrl] = useState(false);
   const location = useLocation();
 
-  const BASE_URL = 'http://127.0.0.1:8000';
+  const BASE_URL = (import.meta as any).env?.VITE_API_BASE ?? 'http://127.0.0.1:8000';
+
+  // Linkify inline citations like: "doc:14 L294-1196 (p2:L100-L130)"
+  function linkifyCitations(text: string): string {
+    if (!text) return text;
+    try {
+      // doc:ID optional L-range optional (pX:Lstart-Lend)
+      const re = /doc:(\d+)(?:\s+L\d+-\d+)?(?:\s*\((p\d+:L\d+-\d+)\))?/g;
+      return text.replace(re, (_m, id: string, pagePart?: string) => {
+        const doc = userDocuments.find(d => String(d.id) === String(id));
+        const name = doc?.filename || `Document ${id}`;
+        const pageBadge = pagePart ? ` · ${pagePart.split(':')[0]}` : '';
+        // Markdown link to Documents viewer route
+        return `[${name}${pageBadge}](/documents/view/${id})`;
+      });
+    } catch {
+      return text;
+    }
+  }
+
+  function renderCitationLink(citation: string): JSX.Element {
+    const match = citation.match(/doc:(\d+)[^)]*/);
+    const id = match ? match[1] : '';
+    const doc = userDocuments.find(d => String(d.id) === String(id));
+    const name = doc?.filename || (id ? `Document ${id}` : citation);
+    const href = id ? `/documents/view/${id}` : undefined;
+    return (
+      <a className="markdown-link" href={href} target="_self" rel="noreferrer">
+        {name}
+      </a>
+    );
+  }
 
   async function fetchWithAuth(path: string, init?: RequestInit & { idempotencyKey?: string }) {
     try {
@@ -106,20 +138,17 @@ export default function Chat() {
         headers['Idempotency-Key'] = init.idempotencyKey;
       }
       const res = await fetch(`${BASE_URL}${path}`, { ...init, headers });
+      console.debug('API request', { path, method: init?.method || 'GET', status: res.status });
       if (!res.ok) {
-        console.error(`API ${path} failed: ${res.status}`, await res.text());
+        const body = await res.text();
+        console.error(`API ${path} failed: ${res.status}`, body);
         throw new Error(`API ${path} failed: ${res.status}`);
       }
-      return res.json();
+      const json = await res.json();
+      console.debug('API response', { path, keys: Object.keys(json || {}), preview: JSON.stringify(json).slice(0,200) });
+      return json;
     } catch (error) {
       console.error(`Network error for ${path}:`, error);
-      // Return a mock response for testing
-      if (path === '/chat/conversations' && init?.method === 'POST') {
-        return { id: `mock-${Date.now()}`, title: 'New conversation', created_at: new Date().toISOString() };
-      }
-      if (path === '/chat/message' && init?.method === 'POST') {
-        return { conversation: { id: 'mock', messages: [] } };
-      }
       throw error;
     }
   }
@@ -231,6 +260,7 @@ export default function Chat() {
             };
             setNewMessage('Ask about this document...');
             sessionStorage.setItem('chat_attached_doc', JSON.stringify(docInfo));
+            setAttachedDoc(docInfo);
           } catch (e) {
             console.warn('Failed to load document for chat attach:', e);
             setNewMessage('Ask about this document...');
@@ -388,29 +418,17 @@ How can I assist you today? Feel free to ask me anything about your health or up
         setUserDocuments(updatedDocs);
       }
 
-      // Show user-friendly confirmation message
-      const userDocMsg: Message = {
-        id: `${Date.now()}-u`,
-        text: `📄 Uploaded: ${file.name}`,
-        sender: 'user',
-        timestamp: new Date(),
-        document: { 
-          name: savedDoc.filename, 
-          type: savedDoc.documentType || file.type, 
-          url: `${BASE_URL}/documents/${savedDoc.id}/file` 
-        }
+      // Cache attached doc for the next send only (no AI call yet)
+      const docInfo = {
+        id: String(savedDoc.id),
+        name: savedDoc.filename,
+        type: savedDoc.documentType || file.type,
+        url: `${BASE_URL}/documents/${savedDoc.id}/file`,
       };
-      await addMessageToConversation(userDocMsg, { suppressAssistant: true });
+      sessionStorage.setItem('chat_attached_doc', JSON.stringify(docInfo));
+      setAttachedDoc(docInfo);
 
-      // Show assistant confirmation with preview
-      const previewText = savedDoc.content_preview || (savedDoc.full_content ? (savedDoc.full_content.substring(0, 200) + '...') : '') || 'Document processed successfully.';
-      const assistantMsg: Message = {
-        id: `${Date.now()}-a`,
-        text: `✅ Document processed successfully!\n\n📄 ${savedDoc.filename}\n\nPreview:\n${previewText}\n\nYou can now ask me questions about this document, or use the summarize buttons in the Documents page for detailed analysis.`,
-        sender: 'assistant',
-        timestamp: new Date()
-      };
-      await addMessageToConversation(assistantMsg, { suppressAssistant: true });
+      // Do not send any chat message yet; the document will be attached to the next send
     } catch (e) {
       console.error('Document upload failed:', e);
       const errorMsg = e instanceof Error ? e.message : 'Failed to process document. Please try again.';
@@ -464,108 +482,35 @@ How can I assist you today? Feel free to ask me anything about your health or up
           conversationId: selectedConversation,
           conversation_id: selectedConversation,
           message: message.text,
-          document: message.document ? { filename: message.document.name, content: '', documentType: message.document.type } : undefined,
+          document: message.document ? { id: (message as any).document?.id, filename: message.document.name, content: '', documentType: message.document.type } : undefined,
           sender: message.sender,
-          suppressAssistant: true, // We'll handle the assistant response separately
+          // Let the backend generate assistant replies unless explicitly suppressed via opts
+          suppressAssistant: Boolean(opts?.suppressAssistant),
         })
       });
-      const updated = resp.conversation as any;
-      setMessages(updated.messages || []);
-      setConversations((prev) => {
-        const others = prev.filter((c) => c.id !== updated.id);
-        return [updated, ...others];
-      });
+      if (resp?.messages) {
+        setMessages(resp.messages || []);
+      } else if (resp?.conversation?.id) {
+        const updatedConvData = await fetchWithAuth(`/chat/conversations/${selectedConversation}`);
+        setMessages(updatedConvData.messages || []);
+      }
+      if (resp?.conversation) {
+        const updated = resp.conversation as any;
+        setConversations((prev) => {
+          const others = prev.filter((c) => c.id !== updated.id);
+          return [updated, ...others];
+        });
+      }
 
-      // If this is a user message and we should get an AI response
-      if (message.sender === 'user' && !opts?.suppressAssistant) {
-        try {
-          // Build conversation history for context
-          const conversationHistory = messages.map(msg => ({
-            role: msg.sender === 'user' ? 'user' : 'assistant',
-            content: msg.text
-          }));
-          
-          // Get enhanced medical AI response with context and citations
-          const token = await user?.getIdToken();
-          if (token) {
-            const chatResponse = await medicalAI.getEnhancedMedicalChatResponse(
-              message.text,
-              token,
-              conversationHistory,
-              userDocuments
-            );
-            
-            // Extract context info from response
-            if (chatResponse.context_used && chatResponse.citations) {
-              const uniqueDocs = new Set(chatResponse.citations.map(c => c.split(' ')[0])); // Extract doc IDs
-              setContextInfo({
-                docsUsed: uniqueDocs.size,
-                snippetsUsed: chatResponse.citations.length
-              });
-            } else {
-              setContextInfo(null);
-            }
-            
-            // Add the AI response with citations
-            const aiMessage: Message = {
-              id: `ai-${Date.now()}`,
-              text: chatResponse.answer,
-              sender: 'assistant',
-              timestamp: new Date(chatResponse.timestamp || Date.now()),
-              citations: chatResponse.citations || [],
-              contextUsed: chatResponse.context_used || false,
-            };
-
-            await fetchWithAuth('/chat/message', {
-              method: 'POST',
-              body: JSON.stringify({
-                conversationId: selectedConversation,
-                conversation_id: selectedConversation,
-                message: aiMessage.text,
-                sender: aiMessage.sender,
-                suppressAssistant: true,
-              })
-            });
-
-            // Refresh the conversation to get updated messages
-            const updatedResp = await fetchWithAuth(`/chat/conversations/${selectedConversation}`);
-            const updatedConv = updatedResp as any;
-            setMessages(updatedConv.messages || []);
-            setConversations((prev) => {
-              const others = prev.filter((c) => c.id !== updatedConv.id);
-              return [updatedConv, ...others];
-            });
-          }
-        } catch (aiError) {
-          console.error('Failed to get AI response:', aiError);
-          // Add a fallback response
-          const fallbackMessage: Message = {
-            id: `fallback-${Date.now()}`,
-            text: "I apologize, but I'm having trouble processing your request right now. Please try again or upload a medical document for more specific assistance.",
-            sender: 'assistant',
-            timestamp: new Date(),
-          };
-
-          await fetchWithAuth('/chat/message', {
-            method: 'POST',
-            body: JSON.stringify({
-              conversationId: selectedConversation,
-              conversation_id: selectedConversation,
-              message: fallbackMessage.text,
-              sender: fallbackMessage.sender,
-              suppressAssistant: true,
-            })
-          });
-
-          // Refresh the conversation
-          const updatedResp = await fetchWithAuth(`/chat/conversations/${selectedConversation}`);
-          const updatedConv = updatedResp as any;
-          setMessages(updatedConv.messages || []);
-          setConversations((prev) => {
-            const others = prev.filter((c) => c.id !== updatedConv.id);
-            return [updatedConv, ...others];
-          });
-        }
+      // With server-side AI, backend will append assistant reply. Refresh if needed.
+      if (!messages.length) {
+        const updatedResp = await fetchWithAuth(`/chat/conversations/${selectedConversation}`);
+        const updatedConv = updatedResp as any;
+        setMessages(updatedConv.messages || []);
+        setConversations((prev) => {
+          const others = prev.filter((c) => c.id !== updatedConv.id);
+          return [updatedConv, ...others];
+        });
       }
     } catch (e) {
       console.error('Failed to send message:', e);
@@ -573,7 +518,7 @@ How can I assist you today? Feel free to ask me anything about your health or up
   };
 
   const handleSendMessage = async () => {
-    if (!newMessage.trim() || !selectedConversation || isLoading) return;
+    if ((!newMessage.trim() && !attachedDoc) || !selectedConversation || isLoading) return;
 
     // Store the message text before clearing the input
     const messageText = newMessage.trim();
@@ -586,14 +531,16 @@ How can I assist you today? Feel free to ask me anything about your health or up
 
     try {
       // attach document from session if present on the first send
-      let attachedDoc: Message['document'] | undefined;
-      const raw = sessionStorage.getItem('chat_attached_doc');
+      let attachedDocLocal: Message['document'] | undefined;
+      const raw = attachedDoc ? JSON.stringify(attachedDoc) : sessionStorage.getItem('chat_attached_doc');
       if (raw) {
         try {
           const parsed = JSON.parse(raw);
-          attachedDoc = { name: parsed.name, type: parsed.type, url: parsed.url };
+          attachedDocLocal = { name: parsed.name, type: parsed.type, url: parsed.url } as any;
+          (attachedDocLocal as any).id = parsed.id;
         } catch {}
         sessionStorage.removeItem('chat_attached_doc');
+        setAttachedDoc(null);
       }
 
       const message: Message = {
@@ -601,8 +548,10 @@ How can I assist you today? Feel free to ask me anything about your health or up
         text: messageText,
         sender: 'user',
         timestamp: new Date(),
-        document: attachedDoc,
+        document: attachedDocLocal,
       };
+      // Optimistic UI: show the user's message immediately
+      setMessages((prev) => [...prev, message]);
 
       await addMessageToConversation(message);
       // Backend immediately returns assistant message; no simulated delay
@@ -625,6 +574,8 @@ How can I assist you today? Feel free to ask me anything about your health or up
     }
     return out.sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
   })();
+
+  const attachedDocInfo = attachedDoc;
 
   return (
     <div className="chat-page">
@@ -833,6 +784,11 @@ How can I assist you today? Feel free to ask me anything about your health or up
                     <div className="message-meta">
                       {message.sender === 'user' ? 'You' : 'MediVise'}
                     </div>
+                    {message.sender === 'assistant' && (
+                      <div className="message-avatar" aria-hidden>
+                        <span style={{ fontWeight: 700, fontSize: '0.7rem', color: '#374151' }}>MV</span>
+                      </div>
+                    )}
                     <div className="message-content">
                       {message.document && (
                         <div className="message-document">
@@ -880,7 +836,7 @@ How can I assist you today? Feel free to ask me anything about your health or up
                             a: ({node, ...props}) => <a className="markdown-link" {...props} target="_blank" rel="noopener noreferrer" />,
                           }}
                           >
-                            {message.text}
+                            {linkifyCitations(message.text)}
                           </ReactMarkdown>
                         </div>
                         {message.citations && message.citations.length > 0 && (
@@ -890,7 +846,7 @@ How can I assist you today? Feel free to ask me anything about your health or up
                               {message.citations.map((citation, idx) => (
                                 <div key={idx} className="citation-item">
                                   <span className="citation-number">[{idx + 1}]</span>
-                                  <span className="citation-text">{citation}</span>
+                                  <span className="citation-text">{renderCitationLink(citation)}</span>
                                 </div>
                               ))}
                             </div>
@@ -901,12 +857,24 @@ How can I assist you today? Feel free to ask me anything about your health or up
                         {toDate(message.timestamp).toLocaleTimeString()}
                       </div>
                     </div>
+                    {message.sender === 'user' && (
+                      <div className="message-avatar" aria-hidden>
+                        <span style={{ fontWeight: 700, fontSize: '0.7rem', color: '#1e40af' }}>You</span>
+                      </div>
+                    )}
                   </div>
                 ))}
 
                 {isLoading && (
-                  <div className="message assistant">
+                  <div className="message assistant ai-thinking">
+                    <div className="message-avatar" aria-hidden>
+                      <div className="glow-dot" />
+                    </div>
                     <div className="message-content">
+                      <div className="thinking-row">
+                        <div className="glow-dot" />
+                        <div className="thinking-text">Thinking…</div>
+                      </div>
                       <div className="typing-indicator">
                         <span></span>
                         <span></span>
@@ -940,6 +908,35 @@ How can I assist you today? Feel free to ask me anything about your health or up
 
               {/* Message Input */}
               <div className="message-input-container">
+                {attachedDocInfo && (
+                  <div style={{
+                    maxWidth: '680px',
+                    margin: '0 auto 8px auto',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    padding: '6px 10px',
+                    background: '#eff6ff',
+                    border: '1px solid #bfdbfe',
+                    borderRadius: '9999px',
+                    color: '#1e40af',
+                    fontSize: '12px'
+                  }}>
+                    <span>📄</span>
+                    <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{attachedDocInfo.name}</span>
+                    <button
+                      onClick={() => { sessionStorage.removeItem('chat_attached_doc'); setAttachedDoc(null); }}
+                      style={{
+                        marginLeft: 'auto',
+                        background: 'transparent',
+                        border: 'none',
+                        color: '#1e40af',
+                        cursor: 'pointer'
+                      }}
+                      aria-label="Remove attached document"
+                    >✕</button>
+                  </div>
+                )}
                 <div className="input-area">
                   <button
                     className="document-upload-btn"
@@ -953,7 +950,7 @@ How can I assist you today? Feel free to ask me anything about your health or up
                     ref={textareaRef}
                     value={newMessage}
                     onChange={(e) => setNewMessage(e.target.value)}
-                    placeholder="Type your message here..."
+                    placeholder="Type something friendly…"
                     onKeyPress={(e) => {
                       if (e.key === 'Enter' && !e.shiftKey) {
                         e.preventDefault();
@@ -985,7 +982,7 @@ How can I assist you today? Feel free to ask me anything about your health or up
                       cursor: (!newMessage.trim() || isLoading) ? 'not-allowed' : 'pointer'
                     }}
                   >
-                    {isLoading ? 'Sending...' : 'Send'}
+                    {isLoading ? '…' : '➤'}
                   </button>
                 </div>
 

@@ -1,7 +1,9 @@
 import httpx
+from fastapi import HTTPException
 import json
 import os
 from typing import Dict, List, Optional, Any, Tuple
+import os
 from datetime import datetime
 import logging
 
@@ -17,22 +19,55 @@ from .llm_prompts import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Lightweight heuristic to decide whether to use memory/docs
+def should_use_memory(message: str) -> bool:
+    try:
+        msg = (message or "").strip().lower()
+        if not msg:
+            return False
+        # Skip if message is very short or greeting-like
+        if len(msg.split()) < 4:
+            return False
+        medical_keywords = [
+            "pain","symptom","symptoms","lab","labs","report","record","records",
+            "test","tests","appointment","appointments","medication","medications",
+            "dose","dosing","fever","result","results","diagnosis","condition",
+            "allergy","allergies","side effect","side effects","blood pressure","glucose"
+        ]
+        return any(k in msg for k in medical_keywords)
+    except Exception:
+        return False
+
 class MedicalLLMService:
     """
     Service for interacting with local Ollama LLMs for medical document analysis.
     Supports both document summarization and Q&A functionality.
     """
     
-    def __init__(self, model_name: str = "phi4-mini", base_url: str = "http://localhost:11434"):
-        self.model_name = model_name
-        self.base_url = base_url
-        self.client = httpx.AsyncClient(timeout=60.0)
+    def __init__(self, model_name: Optional[str] = None, base_url: Optional[str] = None):
+        # Allow env override to avoid host/model mismatch
+        self.model_name = model_name or os.getenv("LLM_MODEL", "phi4-mini")
+        self.base_url = base_url or os.getenv("LLM_BASE_URL", "http://127.0.0.1:11434")
+        # Explicit connect/read timeouts (extended to reduce upstream 502s on slow models)
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0))
         
     async def __aenter__(self):
         return self
         
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.client.aclose()
+
+    async def health(self) -> Dict[str, Any]:
+        """Ping the LLM server to verify connectivity and model availability."""
+        try:
+            r = await self.client.get(f"{self.base_url}/api/tags")
+            r.raise_for_status()
+            data = r.json()
+            models = [m.get("name") for m in data.get("models", [])] if isinstance(data, dict) else []
+            return {"ok": True, "base_url": self.base_url, "model": self.model_name, "available_models": models}
+        except Exception as e:
+            logger.error(f"LLM health failed: {e}")
+            raise HTTPException(status_code=502, detail={"error": "llm_health_failed", "message": str(e)})
     
     async def _make_request(self, prompt: str, system_prompt: str = None) -> str:
         """Make a request to the Ollama API"""
@@ -62,15 +97,18 @@ class MedicalLLMService:
             result = response.json()
             return result.get("response", "").strip()
             
+        except httpx.TimeoutException as e:
+            logger.error(f"LLM timeout: {e}")
+            raise HTTPException(status_code=502, detail={"error": "llm_upstream_timeout", "message": str(e)})
         except httpx.RequestError as e:
             logger.error(f"Request error: {e}")
-            raise Exception(f"Failed to connect to Ollama: {e}")
+            raise HTTPException(status_code=502, detail={"error": "llm_connection_error", "message": str(e)})
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error: {e}")
-            raise Exception(f"Ollama API error: {e}")
+            raise HTTPException(status_code=502, detail={"error": "llm_http_error", "message": str(e)})
         except Exception as e:
-            logger.error(f"Unexpected error: {e}")
-            raise Exception(f"LLM service error: {e}")
+            logger.error(f"Unexpected LLM error: {e}")
+            raise HTTPException(status_code=502, detail={"error": "llm_service_error", "message": str(e)})
     
     async def _run_json_prompt(self, system_prompt: str, user_prompt: str, max_retries: int = 3) -> Dict[str, Any]:
         """
@@ -243,12 +281,26 @@ Please return only valid JSON without any additional text."""
             ChatResponse with answer and citations
         """
         try:
+            # PHI guard: mask identifiers (emails, phones, SSN, MRN/Patient IDs) in snippet text only
+            def _mask_phi(s: str) -> str:
+                try:
+                    import re
+                    s = re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "[REDACTED_SSN]", s)
+                    s = re.sub(r"\b\d{3}-\d{3}-\d{4}\b", "[REDACTED_PHONE]", s)
+                    s = re.sub(r"\(\d{3}\)\s*\d{3}-\d{4}", "[REDACTED_PHONE]", s)
+                    s = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[REDACTED_EMAIL]", s)
+                    s = re.sub(r"\b(?:MRN|Patient ID|Acct|Account)\s*:?\s*\w+\b", "[REDACTED_ID]", s, flags=re.IGNORECASE)
+                except Exception:
+                    pass
+                return s
+
             # Format snippets for the prompt
             snippets_text = ""
             citations = []
-            
+
             for i, snippet in enumerate(snippets, 1):
-                snippets_text += f"Snippet {i} ({snippet.citation}):\n{snippet.text}\n\n"
+                masked_text = _mask_phi(snippet.text or "")
+                snippets_text += f"Snippet {i} ({snippet.citation}):\n{masked_text}\n\n"
                 citations.append(snippet.citation)
             
             user_prompt = QA_USER_TEMPLATE.format(
