@@ -38,6 +38,47 @@ def _strip_emojis(text: str) -> str:
     except Exception:
         return text
 
+def _detect_crisis(text: str) -> str:
+    """Very lightweight crisis classifier. Returns a non-empty reason string if crisis-like."""
+    try:
+        t = (text or "").lower()
+        if not t:
+            return ""
+        crisis_terms = {
+            "suicide": ["suicidal", "suicide", "kill myself", "end my life", "want to die"],
+            "self_harm": ["self harm", "cut myself", "hurt myself"],
+            "overdose": ["overdose", "took too many"],
+            "violence": ["hurt someone", "kill someone", "violence"],
+            "panic": ["panic attack", "can't breathe", "hyperventilating", "heart racing"],
+            "chest_pain": ["chest pain", "pressure in chest"],
+            "stroke": ["one side weak", "face droop", "slurred speech"],
+        }
+        for reason, kws in crisis_terms.items():
+            if any(k in t for k in kws):
+                return reason
+        return ""
+    except Exception:
+        return ""
+
+def _crisis_response(reason: str) -> str:
+    """Return an immediate, supportive, emoji-free message with US resources."""
+    lines = []
+    lines.append("I'm really sorry you're going through this. Your safety matters.")
+    if reason == "panic":
+        lines.append("If this feels urgent or you're in immediate danger, call 911 now.")
+        lines.append("Quick grounding steps you can try right now:")
+        lines.append("- Breathe in for 4 seconds, hold 4, out for 6. Repeat for 1–2 minutes.")
+        lines.append("- Name 5 things you can see, 4 you can touch, 3 you can hear, 2 you can smell, 1 you can taste.")
+    else:
+        lines.append("If this is an emergency or you feel unsafe, call 911 now.")
+    lines.append("")
+    lines.append("24/7 confidential help in the U.S.:")
+    lines.append("- Suicide & Crisis Lifeline: Call or text 988, or chat at 988lifeline.org")
+    lines.append("- Crisis Text Line: Text HOME to 741741")
+    lines.append("")
+    lines.append("If you'd like, I can stay with you here, help you breathe, or connect this to next steps.")
+    return "\n".join(lines)
+
 app = FastAPI(title="MediVise API", version="0.1.0")
 
 # Minimal request logging middleware
@@ -244,8 +285,15 @@ async def chat_message_compat(payload: dict = Body(...), current_user: dict = De
     # Additional guard: skip auto-reply for placeholder uploads or empty text
     user_text = (msg.get("text") or "").strip()
     is_upload_placeholder = user_text.startswith("📄 Uploaded:") or user_text.lower().startswith("uploaded:")
-    if sender == "user" and not suppress_assistant and user_text and not is_upload_placeholder:
-        try:
+    if sender == "user" and not suppress_assistant and not is_upload_placeholder:
+        # CRISIS HANDLER: if message looks urgent, immediately reply with resources (no LLM)
+        crisis_reason = _detect_crisis(user_text)
+        if crisis_reason:
+            reply_text = _crisis_response(crisis_reason)
+            add_message(db, conv, uid, sender="assistant", text=reply_text)
+            # Continue to return updated messages without calling LLM
+        else:
+
             # If a document is attached, force memory/context usage
             use_mem = should_use_memory(msg.get("text") or "") or bool(document)
             snippets = []
@@ -277,9 +325,22 @@ async def chat_message_compat(payload: dict = Body(...), current_user: dict = De
                 for h in reversed(hist):
                     history_formatted.append({"role": ("assistant" if h.sender == "assistant" else "user"), "content": h.text})
                 keywords = extract_keywords_from_conversation(history_formatted)
-                query = (msg.get("text") or "") + " " + " ".join(keywords)
+                # Boost query terms when asking about prescriptions/medications
+                user_lc = (msg.get("text") or "").lower()
+                med_terms = []
+                if any(k in user_lc for k in ["prescription","prescriptions","medication","medications","drug","dose","dosing","sig","strength"]):
+                    med_terms = ["prescription","medications","drug","dose","strength","sig","directions"]
+                query = (msg.get("text") or "") + " " + " ".join(keywords + med_terms)
                 if documents:
-                    snippets = extract_snippets_by_document(documents, query, max_snippets_per_doc=2)
+                    snippets = extract_snippets_by_document(documents, query, max_snippets_per_doc=6)
+                    # If attached doc exists but retrieval returned nothing, try targeted snippet search for prescriptions
+                    if attached_doc and attached_doc.full_content and not snippets:
+                        try:
+                            from .retrieval import extract_snippets
+                            targeted = extract_snippets(attached_doc.full_content, "prescription medications drug strength sig dose directions", max_snippets=6)
+                            snippets = targeted or []
+                        except Exception:
+                            pass
 
             # Build lightweight conversation history for context (last 6 messages)
             hist = db.query(MessageModel).filter(MessageModel.conversation_id == conv.id).order_by(MessageModel.id.desc()).limit(6).all()
@@ -290,72 +351,73 @@ async def chat_message_compat(payload: dict = Body(...), current_user: dict = De
                     history_lines.append(f"{role}: {h.text.strip()}")
             history_block = "\n".join(history_lines[-6:])
 
-            async with MedicalLLMService() as service:
-                # If only a document is attached and there's no user text, produce a brief summary and a follow-up question
-                if (document and not user_text):
-                    if attached_doc and attached_doc.full_content:
-                        from .retrieval import extract_snippets
-                        try:
-                            # Extract a few representative snippets from the attached doc
-                            snippets = extract_snippets(attached_doc.full_content, "brief overall summary", max_snippets=4)
-                            result = await service.rag_answer(
-                                "Give a short, patient-friendly summary and then ask if I should do more (e.g., detailed summary, extract medications, or answer a question).",
-                                snippets
-                            )
-                            reply_text = result.answer
-                        except Exception:
-                            # Fallback to a very brief prompt without snippets
-                            system_prompt = (
-                                "You are a friendly, professional medical assistant. No emojis."
-                            )
+            try:
+                async with MedicalLLMService() as service:
+                    # If only a document is attached and there's no user text, produce a brief summary and a follow-up question
+                    if (document and not user_text):
+                        if attached_doc and attached_doc.full_content:
+                            from .retrieval import extract_snippets
+                            try:
+                                # Extract a few representative snippets from the attached doc
+                                snippets = extract_snippets(attached_doc.full_content, "brief overall summary", max_snippets=4)
+                                result = await service.rag_answer(
+                                    "Give a short, patient-friendly summary and then ask if I should do more (e.g., detailed summary, extract medications, or answer a question).",
+                                    snippets
+                                )
+                                reply_text = result.answer
+                            except Exception:
+                                # Fallback to a very brief prompt without snippets
+                                system_prompt = (
+                                    "You are a friendly, professional medical assistant. No emojis."
+                                )
+                                reply_text = await service._make_request(
+                                    f"Conversation so far:\n{history_block}\n\nTask: Provide a short overview of the uploaded medical document (no emojis). Then ask a helpful follow-up question.",
+                                    system_prompt
+                                )
+                        else:
+                            system_prompt = "You are a friendly, professional medical assistant. No emojis."
                             reply_text = await service._make_request(
                                 f"Conversation so far:\n{history_block}\n\nTask: Provide a short overview of the uploaded medical document (no emojis). Then ask a helpful follow-up question.",
                                 system_prompt
                             )
+                    elif use_mem and snippets:
+                        # Ask with short history context prefix
+                        ask = (msg.get("text") or "").strip()
+                        if history_block:
+                            ask = f"Context:\n{history_block}\n\nUser: {ask}"
+                        result = await service.rag_answer(ask, snippets)
+                        reply_text = result.answer
                     else:
                         system_prompt = "You are a friendly, professional medical assistant. No emojis."
-                        reply_text = await service._make_request(
-                            f"Conversation so far:\n{history_block}\n\nTask: Provide a short overview of the uploaded medical document (no emojis). Then ask a helpful follow-up question.",
-                            system_prompt
-                        )
-                elif use_mem and snippets:
-                    # Ask with short history context prefix
-                    ask = (msg.get("text") or "").strip()
-                    if history_block:
-                        ask = f"Context:\n{history_block}\n\nUser: {ask}"
-                    result = await service.rag_answer(ask, snippets)
-                    reply_text = result.answer
-                else:
-                    system_prompt = "You are a friendly, professional medical assistant. No emojis."
-                    user_prompt = (msg.get("text") or "").strip()
-                    if history_block:
-                        user_prompt = f"Conversation so far:\n{history_block}\n\nUser: {user_prompt}"
-                    reply_text = await service._make_request(user_prompt, system_prompt)
+                        user_prompt = (msg.get("text") or "").strip()
+                        if history_block:
+                            user_prompt = f"Conversation so far:\n{history_block}\n\nUser: {user_prompt}"
+                        reply_text = await service._make_request(user_prompt, system_prompt)
 
-            reply_text = _strip_emojis(reply_text or "").strip()
-            add_message(db, conv, uid, sender="assistant", text=reply_text)
-        except HTTPException as he:
-            # Graceful degradation: persist a friendly fallback response instead of failing 502
-            logger.error(f"AI reply failed (HTTPException): {he.detail}")
-            fallback = (
-                "I’m having trouble reaching the AI right now, but your message was saved. "
-                "Please try again in a moment."
-            )
-            try:
-                add_message(db, conv, uid, sender="assistant", text=fallback)
-            except Exception:
-                # If even persistence fails, continue returning existing messages
-                pass
-        except Exception as e:
-            # Graceful degradation for unexpected errors
-            logger.error(f"AI reply failed: {e}")
-            fallback = (
-                "Something went wrong generating a reply. I saved your message—try sending again shortly."
-            )
-            try:
-                add_message(db, conv, uid, sender="assistant", text=fallback)
-            except Exception:
-                pass
+                reply_text = _strip_emojis(reply_text or "").strip()
+                add_message(db, conv, uid, sender="assistant", text=reply_text)
+            except HTTPException as he:
+                # Graceful degradation: persist a friendly fallback response instead of failing 502
+                logger.warning(f"AI reply failed (HTTPException): {he.detail}")
+                fallback = (
+                    "I’m having trouble reaching the AI right now, but your message was saved. "
+                    "Please try again in a moment."
+                )
+                try:
+                    add_message(db, conv, uid, sender="assistant", text=fallback)
+                except Exception:
+                    # If even persistence fails, continue returning existing messages
+                    pass
+            except Exception as e:
+                # Graceful degradation for unexpected errors
+                logger.exception("AI reply failed")
+                fallback = (
+                    "Something went wrong generating a reply. I saved your message—try sending again shortly."
+                )
+                try:
+                    add_message(db, conv, uid, sender="assistant", text=fallback)
+                except Exception:
+                    pass
 
     # Return updated messages
     q = db.query(MessageModel).filter(MessageModel.conversation_id == conv.id).order_by(MessageModel.id.asc())
