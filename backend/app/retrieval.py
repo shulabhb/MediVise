@@ -2,7 +2,7 @@ from typing import List, Dict, Optional
 import re
 from .schemas_summary import DocumentSnippet
 
-def extract_snippets(full_text: str, query: str, max_snippets: int = 6, window: int = 450) -> List[DocumentSnippet]:
+def extract_snippets(full_text: str, query: str, max_snippets: int = 5, window: int = 450) -> List[DocumentSnippet]:
     """
     Extract relevant snippets from text based on keyword matching.
     
@@ -76,6 +76,16 @@ def extract_snippets(full_text: str, query: str, max_snippets: int = 6, window: 
     
     return results
 
+def _uniq_keep_order_snippets(snippets: List[DocumentSnippet]) -> List[DocumentSnippet]:
+    seen = set()
+    out: List[DocumentSnippet] = []
+    for s in snippets:
+        key = " ".join((s.text or "").lower().split())
+        if key not in seen:
+            seen.add(key)
+            out.append(s)
+    return out
+
 def extract_snippets_by_document(documents: List[Dict], query: str, max_snippets_per_doc: int = 3) -> List[DocumentSnippet]:
     """
     Extract snippets from multiple documents.
@@ -108,8 +118,10 @@ def extract_snippets_by_document(documents: List[Dict], query: str, max_snippets
     
     # Sort all snippets by relevance
     all_snippets.sort(key=lambda x: x.relevance_score, reverse=True)
-    
-    return all_snippets
+
+    # Enforce max 5 unique snippets globally by text
+    unique = _uniq_keep_order_snippets(all_snippets)[:5]
+    return unique
 
 def extract_keywords_from_conversation(conversation_history: List[Dict]) -> List[str]:
     """

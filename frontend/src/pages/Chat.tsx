@@ -38,6 +38,18 @@ function toDate(value: any): Date {
   return value instanceof Date ? value : new Date(value);
 }
 
+function formatTimestamp(d: Date): string {
+  try {
+    const now = new Date();
+    const isToday = d.toDateString() === now.toDateString();
+    const datePart = isToday ? '' : d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) + ' ';
+    const timePart = d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+    return datePart + timePart;
+  } catch {
+    return d.toLocaleString();
+  }
+}
+
 interface Message {
   id: string;
   text: string;
@@ -88,6 +100,7 @@ export default function Chat() {
   }, [newMessage]);
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
   const [isCreatingNew, setIsCreatingNew] = useState(false);
+  const creatingRef = useRef(false);
   const [, setHasProcessedUrl] = useState(false);
   const location = useLocation();
 
@@ -111,7 +124,7 @@ export default function Chat() {
     }
   }
 
-  function renderCitationLink(citation: string): JSX.Element {
+  function renderCitationLink(citation: string): any {
     const match = citation.match(/doc:(\d+)[^)]*/);
     const id = match ? match[1] : '';
     const doc = userDocuments.find(d => String(d.id) === String(id));
@@ -125,32 +138,31 @@ export default function Chat() {
   }
 
   async function fetchWithAuth(path: string, init?: RequestInit & { idempotencyKey?: string }) {
-    try {
-      const token = await user?.getIdToken();
+    const doFetch = async (forceRefresh = false) => {
+      const token = await user?.getIdToken(forceRefresh);
       const headers: Record<string, string> = {
         ...(init?.headers as Record<string, string> | undefined),
-        'Authorization': token ? `Bearer ${token}` : '',
+        ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
       };
-      if (init?.body && !(init?.headers as any)?.['Content-Type']) {
-        headers['Content-Type'] = 'application/json';
-      }
-      if (init?.idempotencyKey) {
-        headers['Idempotency-Key'] = init.idempotencyKey;
-      }
+      if (init?.body && !(init?.headers as any)?.['Content-Type']) headers['Content-Type'] = 'application/json';
+      if (init?.idempotencyKey) headers['Idempotency-Key'] = init.idempotencyKey;
       const res = await fetch(`${BASE_URL}${path}`, { ...init, headers });
-      console.debug('API request', { path, method: init?.method || 'GET', status: res.status });
-      if (!res.ok) {
-        const body = await res.text();
-        console.error(`API ${path} failed: ${res.status}`, body);
-        throw new Error(`API ${path} failed: ${res.status}`);
-      }
-      const json = await res.json();
-      console.debug('API response', { path, keys: Object.keys(json || {}), preview: JSON.stringify(json).slice(0,200) });
-      return json;
-    } catch (error) {
-      console.error(`Network error for ${path}:`, error);
-      throw error;
+      return res;
+    };
+
+    // First attempt
+    let res = await doFetch(false);
+    if (res.status === 401 && user) {
+      // Retry once with a forced token refresh
+      res = await doFetch(true);
     }
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      console.error(`API ${path} failed: ${res.status}`, body);
+      throw new Error(`API ${path} failed: ${res.status}${body ? ' - ' + body : ''}`);
+    }
+    const json = await res.json().catch(() => ({}));
+    return json;
   }
 
   // Initialize from backend and migrate localStorage if needed
@@ -170,6 +182,12 @@ export default function Chat() {
       }
       try {
         let convs: any[] = await fetchWithAuth('/chat/conversations');
+        // Normalize timestamps to avoid UI breakage if backend omits 'timestamp'
+        convs = (convs || []).map((c: any) => ({
+          ...c,
+          timestamp: c?.timestamp || c?.updated_at || c?.created_at || new Date().toISOString(),
+          title: c?.title || 'Conversation',
+        }));
         const hasServer = Array.isArray(convs) && convs.length > 0;
         const local = localStorage.getItem('chat_conversations');
         const migrated = localStorage.getItem('chat_migrated') === '1';
@@ -211,12 +229,7 @@ export default function Chat() {
           setSelectedConversation((convs as any)[0].id);
           sessionStorage.setItem('current_chat_id', (convs as any)[0].id);
         } else {
-          // Only create new conversation if not already creating one via URL params
-          const params = new URLSearchParams(location.search);
-          const createNew = params.get('new') === '1';
-          if (!createNew) {
-            await createNewConversation();
-          }
+          // Do NOT auto-create here; creation is handled only via ?new=1 or explicit New Chat button
         }
       } catch (e) {
         console.error('Failed to initialize conversations:', e);
@@ -231,7 +244,7 @@ export default function Chat() {
     const createNew = params.get('new') === '1';
     const docId = params.get('docId');
 
-    if (!createNew || isCreatingNew) return;
+    if (!createNew || isCreatingNew || creatingRef.current) return;
 
     // EARLY: remove params so StrictMode second mount won't see ?new=1
     const url = new URL(window.location.href);
@@ -245,6 +258,7 @@ export default function Chat() {
 
     setHasProcessedUrl(true);
     setIsCreatingNew(true);
+    creatingRef.current = true;
 
     (async () => {
       try {
@@ -268,6 +282,7 @@ export default function Chat() {
         }
       } finally {
         setIsCreatingNew(false);
+        creatingRef.current = false;
         endOnce(LOCK);
       }
     })();
@@ -323,13 +338,10 @@ export default function Chat() {
   }, [messages, isLoading, selectedConversation]);
 
   const createNewConversation = async () => {
-    const LOCK = 'creating_new_chat_lock';
+    if (creatingRef.current) return;
+    creatingRef.current = true;
+    setIsCreatingNew(true);
     const nonce = makeNonce();
-
-    if (!beginOnce(LOCK)) {
-      // Someone else (second mount) is already creating a chat; just bail
-      return;
-    }
 
     try {
       const created = await fetchWithAuth('/chat/conversations', {
@@ -339,7 +351,12 @@ export default function Chat() {
 
       setConversations((prev) => {
         if (prev.find(c => c.id === created.id)) return prev; // de-dupe
-        return [created as any, ...prev];
+        const normalized = {
+          ...(created as any),
+          timestamp: (created as any)?.updated_at || (created as any)?.created_at || new Date().toISOString(),
+          title: (created as any)?.title || 'Conversation',
+        };
+        return [normalized, ...prev];
       });
       setSelectedConversation(created.id);
       sessionStorage.setItem('current_chat_id', created.id);
@@ -378,8 +395,11 @@ How can I assist you today? Feel free to ask me anything about your health or up
       setMessages(updatedConv.messages || []);
     } catch (e) {
       console.error('Failed to create conversation:', e);
+      const msg = e instanceof Error ? e.message : 'Failed to create conversation';
+      alert(`New chat failed: ${msg}`);
     } finally {
-      endOnce(LOCK);
+      setIsCreatingNew(false);
+      creatingRef.current = false;
     }
   };
 
@@ -579,6 +599,13 @@ How can I assist you today? Feel free to ask me anything about your health or up
 
   return (
     <div className="chat-page">
+      <style>{`
+        @keyframes pulseGlow {
+          0% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.55); }
+          70% { box-shadow: 0 0 0 10px rgba(59, 130, 246, 0); }
+          100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0); }
+        }
+      `}</style>
       <Link to="/about">
         <img src={logo2} alt="MediVise" className="nav-logo-small" />
       </Link>
@@ -810,12 +837,12 @@ How can I assist you today? Feel free to ask me anything about your health or up
                             components={{
                             // Headings with better hierarchy
                             h1: ({node, ...props}) => <h1 className="markdown-h1" {...props} />,
-                            h2: ({node, ...props}) => <h2 className="markdown-h2" {...props} />,
-                            h3: ({node, ...props}) => <h3 className="markdown-h3" {...props} />,
+                            h2: ({node, ...props}) => <h2 className="markdown-h2" style={{ margin: '6px 0 4px' }} {...props} />,
+                            h3: ({node, ...props}) => <h3 className="markdown-h3" style={{ margin: '6px 0 4px' }} {...props} />,
                             // Lists with better spacing
-                            ul: ({node, ...props}) => <ul className="markdown-list" {...props} />,
-                            ol: ({node, ...props}) => <ol className="markdown-list" {...props} />,
-                            li: ({node, ...props}) => <li className="markdown-list-item" {...props} />,
+                            ul: ({node, ...props}) => <ul className="markdown-list" style={{ margin: '6px 0 6px 18px', paddingLeft: '16px' }} {...props} />,
+                            ol: ({node, ...props}) => <ol className="markdown-list" style={{ margin: '6px 0 6px 18px', paddingLeft: '16px' }} {...props} />,
+                            li: ({node, ...props}) => <li className="markdown-list-item" style={{ margin: '2px 0' }} {...props} />,
                             // Emphasis
                             strong: ({node, ...props}) => <strong className="markdown-strong" {...props} />,
                             em: ({node, ...props}) => <em className="markdown-em" {...props} />,
@@ -829,7 +856,7 @@ How can I assist you today? Feel free to ask me anything about your health or up
                               );
                             },
                             // Paragraphs with spacing
-                            p: ({node, ...props}) => <p className="markdown-paragraph" {...props} />,
+                            p: ({node, ...props}) => <p className="markdown-paragraph" style={{ margin: '6px 0' }} {...props} />,
                             // Blockquotes
                             blockquote: ({node, ...props}) => <blockquote className="markdown-blockquote" {...props} />,
                             // Links
@@ -854,7 +881,7 @@ How can I assist you today? Feel free to ask me anything about your health or up
                         )}
                       </div>
                       <div className="message-time">
-                        {toDate(message.timestamp).toLocaleTimeString()}
+                        {formatTimestamp(toDate(message.timestamp))}
                       </div>
                     </div>
                     {message.sender === 'user' && (
@@ -867,18 +894,10 @@ How can I assist you today? Feel free to ask me anything about your health or up
 
                 {isLoading && (
                   <div className="message assistant ai-thinking">
-                    <div className="message-avatar" aria-hidden>
-                      <div className="glow-dot" />
-                    </div>
                     <div className="message-content">
-                      <div className="thinking-row">
-                        <div className="glow-dot" />
+                      <div className="thinking-row" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#3b82f6', opacity: 0.85 }} />
                         <div className="thinking-text">Thinking…</div>
-                      </div>
-                      <div className="typing-indicator">
-                        <span></span>
-                        <span></span>
-                        <span></span>
                       </div>
                     </div>
                   </div>
@@ -947,6 +966,8 @@ How can I assist you today? Feel free to ask me anything about your health or up
                   </button>
 
                   <textarea
+                    id="chat-input"
+                    name="chatInput"
                     ref={textareaRef}
                     value={newMessage}
                     onChange={(e) => setNewMessage(e.target.value)}
@@ -976,10 +997,13 @@ How can I assist you today? Feel free to ask me anything about your health or up
                   <button
                     className="send-btn"
                     onClick={handleSendMessage}
-                    disabled={!newMessage.trim() || isLoading}
+                    disabled={(!newMessage.trim() && !attachedDocInfo) || isLoading}
                     style={{
-                      opacity: (!newMessage.trim() || isLoading) ? 0.5 : 1,
-                      cursor: (!newMessage.trim() || isLoading) ? 'not-allowed' : 'pointer'
+                      opacity: isLoading ? 1 : ((!newMessage.trim() && !attachedDocInfo) ? 0.5 : 1),
+                      cursor: isLoading ? 'default' : ((!newMessage.trim() && !attachedDocInfo) ? 'not-allowed' : 'pointer'),
+                      transition: 'box-shadow 120ms ease',
+                      animation: isLoading ? 'pulseGlow 1200ms ease-in-out infinite' : 'none',
+                      borderColor: isLoading ? '#3b82f6' : undefined
                     }}
                   >
                     {isLoading ? '…' : '➤'}
@@ -1001,6 +1025,8 @@ How can I assist you today? Feel free to ask me anything about your health or up
                         Drag & drop a PDF here or click to browse
                       </div>
                       <input
+                        id="document-upload-input"
+                        name="documentUpload"
                         ref={fileInputRef}
                         type="file"
                         accept=".pdf"

@@ -21,9 +21,9 @@ from .models_memory import UserMemory, DocumentContext, MemoryInteraction, Base 
 from .llm_service import summarize_document, answer_question, MedicalLLMService, should_use_memory
 from .schemas_summary import SummaryRequest, SummaryResponse, ChatResponse, DocumentSnippet
 from .retrieval import extract_snippets_by_document, extract_keywords_from_conversation
-from .user_memory_service import UserMemoryService
 from .pdf_context_extractor import PDFContextExtractor
 from .models_memory import UserMemory, DocumentContext, MemoryInteraction
+from .config import MAX_CONTEXT_MESSAGES
 
 # Initialize logger
 logger = logging.getLogger(__name__)
@@ -189,7 +189,7 @@ def add_message(db: Session, conversation: Conversation, user_id: str, *, sender
     return msg
 
 # Initialize services
-memory_service = UserMemoryService()
+# memory_service = UserMemoryService() # Removed as per edit hint
 context_extractor = PDFContextExtractor()
 
 
@@ -351,22 +351,58 @@ async def chat_message_compat(payload: dict = Body(...), current_user: dict = De
                     history_lines.append(f"{role}: {h.text.strip()}")
             history_block = "\n".join(history_lines[-6:])
 
+            # Friendly fallback: user mentions a PDF/report but no document attached and no snippets
+            try:
+                wants_doc_help = any(k in user_text.lower() for k in ["pdf", "report", "document"]) if user_text else False
+                if wants_doc_help and not attached_doc and not snippets:
+                    reply_text = (
+                        "Sure — please upload the PDF or attach it here and I can walk you through the key findings, plain language explanations, and next steps."
+                    )
+                    add_message(db, conv, uid, sender="assistant", text=reply_text)
+                    # Skip LLM call in this case
+                    q = db.query(MessageModel).filter(MessageModel.conversation_id == conv.id).order_by(MessageModel.id.asc())
+                    msgs = q.all()
+                    def _msg_to_json(m: MessageModel):
+                        return {
+                            "id": m.id,
+                            "text": m.text,
+                            "sender": m.sender or "user",
+                            "timestamp": m.created_at.isoformat() if m.created_at else datetime.now().isoformat(),
+                            "document": m.document_data or None,
+                        }
+                    return {
+                        "conversation_id": conv.id,
+                        "conversation": {
+                            "id": conv.id,
+                            "title": conv.title or "Conversation",
+                            "created_at": conv.created_at.isoformat() if conv.created_at else None,
+                            "updated_at": conv.updated_at.isoformat() if conv.updated_at else None,
+                        },
+                        "messages": [_msg_to_json(m) for m in msgs],
+                    }
+            except Exception:
+                pass
+
             try:
                 async with MedicalLLMService() as service:
                     # If only a document is attached and there's no user text, produce a brief summary and a follow-up question
                     if (document and not user_text):
                         if attached_doc and attached_doc.full_content:
-                            from .retrieval import extract_snippets
                             try:
-                                # Extract a few representative snippets from the attached doc
-                                snippets = extract_snippets(attached_doc.full_content, "brief overall summary", max_snippets=4)
-                                result = await service.rag_answer(
-                                    "Give a short, patient-friendly summary and then ask if I should do more (e.g., detailed summary, extract medications, or answer a question).",
-                                    snippets
-                                )
-                                reply_text = result.answer
+                                # Single fast call: structured summary (summary + highlights)
+                                structured = await summarize_document(attached_doc.full_content)
+                                summary_text = (structured.get("summary") or "").strip()
+                                highlights = structured.get("highlights") or []
+
+                                parts = []
+                                if summary_text:
+                                    parts.append(f"**Summary:** {summary_text}")
+                                if highlights:
+                                    parts.append("\n**Key highlights:**\n" + "\n".join(f"- {h}" for h in highlights))
+                                parts.append("\n**Next steps:** If helpful, I can explain any section in more detail or focus on imaging or risks.")
+                                reply_text = "\n\n".join(parts).strip()
                             except Exception:
-                                # Fallback to a very brief prompt without snippets
+                                # Final fallback to a brief assistant message
                                 system_prompt = (
                                     "You are a friendly, professional medical assistant. No emojis."
                                 )
@@ -385,8 +421,22 @@ async def chat_message_compat(payload: dict = Body(...), current_user: dict = De
                         ask = (msg.get("text") or "").strip()
                         if history_block:
                             ask = f"Context:\n{history_block}\n\nUser: {ask}"
+                        # If the user asked to summarize, include structured meds/highlights
+                        wants_summary = any(k in (msg.get("text") or "").lower() for k in ["summary", "summarize", "explain the document", "overview"]) if msg.get("text") else False
                         result = await service.rag_answer(ask, snippets)
-                        reply_text = result.answer
+                        base = result.answer
+                        if wants_summary and attached_doc and attached_doc.full_content:
+                            try:
+                                structured = await summarize_document(attached_doc.full_content)
+                                highlights = structured.get("highlights") or []
+                                parts = [base]
+                                if highlights:
+                                    parts.append("\n**Key highlights:**\n" + "\n".join(f"- {h}" for h in highlights))
+                                reply_text = "\n\n".join(parts).strip()
+                            except Exception:
+                                reply_text = base
+                        else:
+                            reply_text = base
                     else:
                         system_prompt = "You are a friendly, professional medical assistant. No emojis."
                         user_prompt = (msg.get("text") or "").strip()
@@ -1015,6 +1065,20 @@ async def conversational_medical_chat(
         from .llm_service import MedicalLLMService
         
         async with MedicalLLMService() as service:
+            # Lightweight greeting shortcut (no LLM call)
+            try:
+                msg_norm = (request.user_message or "").strip().lower()
+                if msg_norm in {"hi", "hello", "hey"} and len(msg_norm) < 6:
+                    return {
+                        "success": True,
+                        "response": "Hi! I’m MediVise. I can explain your documents, clarify meds, and prep you for visits. Upload a file or ask a question to start.",
+                        "conversation_id": None,
+                        "timestamp": datetime.now().isoformat(),
+                        "model_used": service.model_name,
+                        "context_used": False
+                    }
+            except Exception:
+                pass
             # Build context from user documents and conversation history
             context_info = ""
             
@@ -1180,9 +1244,9 @@ async def enhanced_conversational_chat(
                     })
 
             # Get relevant user memories
-            user_memories = await memory_service.get_relevant_memories(
-                db, uid, request.user_message, limit=5
-            )
+            # user_memories = await memory_service.get_relevant_memories( # Removed as per edit hint
+            #     db, uid, request.user_message, limit=5
+            # )
 
             # Extract keywords from conversation history
             keywords = extract_keywords_from_conversation(request.conversation_history)
@@ -1192,7 +1256,20 @@ async def enhanced_conversational_chat(
             snippets = extract_snippets_by_document(documents, query, max_snippets_per_doc=2)
         
         async with MedicalLLMService() as service:
-            if use_mem and (snippets or user_memories):
+            # Lightweight greeting shortcut (no LLM call)
+            try:
+                msg_norm = (request.user_message or "").strip().lower()
+                if msg_norm in {"hi", "hello", "hey"} and len(msg_norm) < 6:
+                    return ChatResponse(
+                        answer="Hi! I’m MediVise. I can explain your documents, clarify meds, and prep you for visits. Upload a file or ask a question to start.",
+                        citations=[],
+                        context_used=False,
+                        model_used=service.model_name,
+                        timestamp=datetime.now().isoformat()
+                    )
+            except Exception:
+                pass
+            if use_mem and (snippets): # Removed user_memories from condition
                 # Use RAG with document context and user memories
                 enhanced_snippets = []
                 
@@ -1201,13 +1278,13 @@ async def enhanced_conversational_chat(
                     enhanced_snippets.append(snippet)
                 
                 # Add memory snippets
-                for memory in user_memories:
-                    memory_snippet = DocumentSnippet(
-                        text=f"User memory: {memory['value']}",
-                        citation=f"memory:{memory['category']}:{memory['key']}",
-                        relevance_score=memory['confidence']
-                    )
-                    enhanced_snippets.append(memory_snippet)
+                # for memory in user_memories: # Removed as per edit hint
+                #     memory_snippet = DocumentSnippet( # Removed as per edit hint
+                #         text=f"User memory: {memory['value']}", # Removed as per edit hint
+                #         citation=f"memory:{memory['category']}:{memory['key']}", # Removed as per edit hint
+                #         relevance_score=memory['confidence'] # Removed as per edit hint
+                #     ) # Removed as per edit hint
+                #     enhanced_snippets.append(memory_snippet) # Removed as per edit hint
                 
                 result = await service.rag_answer(request.user_message, enhanced_snippets)
 
@@ -1217,10 +1294,10 @@ async def enhanced_conversational_chat(
                     result.answer = f"{preface}\n\n{result.answer}"
                 
                 # Learn from this interaction
-                await memory_service.learn_from_chat(
-                    db, uid, request.user_message, result.answer, 
-                    {'documents_used': len(documents), 'memories_used': len(user_memories)}
-                )
+                # await memory_service.learn_from_chat( # Removed as per edit hint
+                #     db, uid, request.user_message, result.answer,  # Removed as per edit hint
+                #     {'documents_used': len(documents), 'memories_used': len(user_memories)} # Removed as per edit hint
+                # ) # Removed as per edit hint
                 
             else:
                 # Fallback to general conversation with user memories
@@ -1247,10 +1324,10 @@ Provide a helpful response. If you need specific medical information, suggest th
                 )
                 
                 # Learn from this interaction
-                await memory_service.learn_from_chat(
-                    db, uid, request.user_message, result.answer, 
-                    {'memories_used': len(user_memories)}
-                )
+                # await memory_service.learn_from_chat( # Removed as per edit hint
+                #     db, uid, request.user_message, result.answer,  # Removed as per edit hint
+                #     {'memories_used': len(user_memories)} # Removed as per edit hint
+                # ) # Removed as per edit hint
             
             return result
             
@@ -1312,8 +1389,9 @@ async def get_memory_summary(
     """Get a summary of user's memories."""
     try:
         uid = current_user.get("uid")
-        summary = await memory_service.get_user_memory_summary(db, uid)
-        return summary
+        # summary = await memory_service.get_user_memory_summary(db, uid) # Removed as per edit hint
+        # return summary # Removed as per edit hint
+        return {"message": "Memory summary endpoint is currently disabled."} # Placeholder
     except Exception as e:
         logger.error(f"Error getting memory summary: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to get memory summary: {str(e)}")
@@ -1329,13 +1407,9 @@ async def search_memories(
     """Search user's memories."""
     try:
         uid = current_user.get("uid")
-        memories = await memory_service.get_relevant_memories(db, uid, query, limit)
-        
-        # Filter by category if specified
-        if category:
-            memories = [m for m in memories if m['category'] == category]
-        
-        return {"memories": memories, "query": query, "count": len(memories)}
+        # memories = await memory_service.get_relevant_memories(db, uid, query, limit) # Removed as per edit hint
+        # return {"memories": memories, "query": query, "count": len(memories)} # Removed as per edit hint
+        return {"message": "Memory search endpoint is currently disabled."} # Placeholder
     except Exception as e:
         logger.error(f"Error searching memories: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to search memories: {str(e)}")

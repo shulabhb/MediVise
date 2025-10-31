@@ -290,24 +290,6 @@ export default function Documents() {
                         <>
                           <TooltipButton ariaLabel="View document" label="View" onClick={() => openViewer(d.id)}><EyeIcon /></TooltipButton>
                           <TooltipButton ariaLabel="Download document" label="Download" onClick={() => downloadDoc(d.id, d.filename)}><DownloadIcon /></TooltipButton>
-                          <button 
-                            className="button" 
-                            onClick={() => handleSummarize(d.id, 'clinical')}
-                            disabled={summarizingId?.id === d.id}
-                            style={{ fontSize: '12px', padding: '4px 8px' }}
-                            title="Generate clinical summary"
-                          >
-                            {summarizingId?.id === d.id && summarizingId?.style === 'clinical' ? 'Summarizing...' : '📋 Clinical'}
-                          </button>
-                          <button 
-                            className="button" 
-                            onClick={() => handleSummarize(d.id, 'patient-friendly')}
-                            disabled={summarizingId?.id === d.id}
-                            style={{ fontSize: '12px', padding: '4px 8px' }}
-                            title="Generate patient-friendly summary"
-                          >
-                            {summarizingId?.id === d.id && summarizingId?.style === 'patient-friendly' ? 'Summarizing...' : '💬 Patient-friendly'}
-                          </button>
                           <TooltipButton ariaLabel="Rename document" label="Rename" onClick={() => startRename(d)}><PencilIcon /></TooltipButton>
                           <TooltipButton ariaLabel="Delete document" label="Delete" onClick={() => deleteDoc(d.id, d.filename)}><TrashIcon /></TooltipButton>
                         </>
